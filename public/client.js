@@ -37,7 +37,8 @@ const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
 
 function resize() {
   const coarse = matchMedia('(pointer: coarse)').matches;
-  pixelRatio = Math.min(devicePixelRatio || 1, coarse ? 1.6 : 2);
+  const pixelBudgetCap = Math.sqrt(4_500_000 / Math.max(1, innerWidth * innerHeight));
+  pixelRatio = Math.max(1, Math.min(devicePixelRatio || 1, coarse ? 1.5 : 2, pixelBudgetCap));
   canvas.width = Math.max(1, Math.floor(innerWidth * pixelRatio));
   canvas.height = Math.max(1, Math.floor(innerHeight * pixelRatio));
   canvas.style.width = `${innerWidth}px`;
@@ -278,12 +279,7 @@ function drawCircle(x, y, r, fill, stroke = 'rgba(255,255,255,.34)', lineWidth =
   const point = toScreen(x, y);
   const rr = r * camera.zoom;
   if (point.x + rr < 0 || point.x - rr > innerWidth || point.y + rr < 0 || point.y - rr > innerHeight) return;
-  if (glow && rr > 8) {
-    ctx.shadowColor = fill;
-    ctx.shadowBlur = Math.min(18, Math.max(4, rr * 0.2));
-  } else {
-    ctx.shadowBlur = 0;
-  }
+  ctx.shadowBlur = 0;
   ctx.beginPath();
   ctx.arc(point.x, point.y, rr, 0, Math.PI * 2);
   ctx.fillStyle = fill;
@@ -301,8 +297,6 @@ function drawVirus(virus) {
   const r = radius(virus.mass) * camera.zoom;
   const spikes = 24;
   ctx.save();
-  ctx.shadowColor = '#39ff88';
-  ctx.shadowBlur = Math.min(22, r * 0.25);
   ctx.beginPath();
   for (let i = 0; i < spikes * 2; i++) {
     const angle = i * Math.PI / spikes;
