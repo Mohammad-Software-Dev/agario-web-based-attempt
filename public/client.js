@@ -23,6 +23,7 @@ let fps = 60;
 let lastAlive = true;
 let pixelRatio = 1;
 let cameraInitialized = false;
+let backgroundGradient = null;
 
 const visualCells = new Map();
 const visualEjected = new Map();
@@ -42,6 +43,10 @@ function resize() {
   canvas.style.width = `${innerWidth}px`;
   canvas.style.height = `${innerHeight}px`;
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  backgroundGradient = ctx.createRadialGradient(innerWidth * 0.5, innerHeight * 0.45, 0, innerWidth * 0.5, innerHeight * 0.45, Math.max(innerWidth, innerHeight) * 0.8);
+  backgroundGradient.addColorStop(0, '#101d45');
+  backgroundGradient.addColorStop(0.55, '#08152d');
+  backgroundGradient.addColorStop(1, '#040a18');
 }
 addEventListener('resize', resize, { passive: true });
 resize();
@@ -273,22 +278,22 @@ function drawCircle(x, y, r, fill, stroke = 'rgba(255,255,255,.34)', lineWidth =
   const point = toScreen(x, y);
   const rr = r * camera.zoom;
   if (point.x + rr < 0 || point.x - rr > innerWidth || point.y + rr < 0 || point.y - rr > innerHeight) return;
-  ctx.save();
   if (glow && rr > 8) {
     ctx.shadowColor = fill;
     ctx.shadowBlur = Math.min(18, Math.max(4, rr * 0.2));
+  } else {
+    ctx.shadowBlur = 0;
   }
   ctx.beginPath();
   ctx.arc(point.x, point.y, rr, 0, Math.PI * 2);
   ctx.fillStyle = fill;
   ctx.fill();
+  ctx.shadowBlur = 0;
   if (stroke) {
-    ctx.shadowBlur = 0;
     ctx.strokeStyle = stroke;
     ctx.lineWidth = lineWidth;
     ctx.stroke();
   }
-  ctx.restore();
 }
 
 function drawVirus(virus) {
@@ -327,11 +332,7 @@ function draw() {
   updateCamera(dt);
 
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-  const background = ctx.createRadialGradient(innerWidth * 0.5, innerHeight * 0.45, 0, innerWidth * 0.5, innerHeight * 0.45, Math.max(innerWidth, innerHeight) * 0.8);
-  background.addColorStop(0, '#101d45');
-  background.addColorStop(0.55, '#08152d');
-  background.addColorStop(1, '#040a18');
-  ctx.fillStyle = background;
+  ctx.fillStyle = backgroundGradient || '#040a18';
   ctx.fillRect(0, 0, innerWidth, innerHeight);
 
   if (snapshot) {
