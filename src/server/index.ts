@@ -14,7 +14,7 @@ const num = (name: string, fallback: number) => {
 };
 const PORT = num('PORT', 3000);
 const TICK_RATE = Math.min(60, num('TICK_RATE', 30));
-const SNAPSHOT_RATE = Math.min(TICK_RATE, num('SNAPSHOT_RATE', 15));
+const SNAPSHOT_RATE = Math.min(TICK_RATE, num('SNAPSHOT_RATE', 20));
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '').split(',').map(v => v.trim()).filter(Boolean);
 
 const game = new Game({
