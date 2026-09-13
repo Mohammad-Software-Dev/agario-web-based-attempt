@@ -1,19 +1,22 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
   <meta name="theme-color" content="#07111f" />
   <title>Cell Arena</title>
-  <link rel="stylesheet" href="/styles.css" />
+  <link rel="stylesheet" href="/styles.css?v=6" />
 </head>
 <body>
   <canvas id="game" aria-label="Cell Arena game canvas"></canvas>
   <div id="hud" class="hidden">
     <div class="brand">CELL ARENA</div>
+    <div id="scorePanel" aria-live="polite"><span>SCORE</span><strong id="scoreValue">0</strong></div>
     <div id="stats"></div>
     <ol id="leaderboard"></ol>
     <div class="controls">Move: mouse/touch · Split: <b>Space</b> · Eject: <b>W</b></div>
+    <canvas id="minimap" width="180" height="180" aria-label="World minimap"></canvas>
+    <button id="themeToggle" class="theme-toggle" type="button" aria-label="Switch color theme">☀ Light</button>
   </div>
   <div id="menu" class="panel-wrap">
     <div class="panel">
@@ -32,6 +35,6 @@
     <div class="panel compact"><h2>You were eaten</h2><p id="deathScore"></p><button id="respawn">Respawn</button></div>
   </div>
   <div id="mobileControls" class="mobile-controls hidden"><button id="ejectBtn">Eject</button><button id="splitBtn">Split</button></div>
-  <script type="module" src="/client.js?v=5"></script>
+  <script type="module" src="/client.js?v=6"></script>
 </body>
 </html>
