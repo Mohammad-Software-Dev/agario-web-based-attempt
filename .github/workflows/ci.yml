@@ -12,5 +12,6 @@ jobs:
         with:
           node-version: 22
       - run: npm install --no-audit --no-fund
+      - run: node --check public/client.js
       - run: npm run check
       - run: docker build -t cell-arena:test .
