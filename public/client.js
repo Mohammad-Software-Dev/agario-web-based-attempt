@@ -16,6 +16,7 @@ const WORLD_MARGIN = 8;
 const INPUT_HZ = 45;
 const PING_INTERVAL_MS = 1500;
 const UI_INTERVAL_MS = 250;
+const REMOTE_HISTORY_LIMIT = 12;
 
 let ws = null;
 let snapshot = null;
@@ -30,11 +31,13 @@ let cameraInitialized = false;
 let backgroundGradient = null;
 let lastUiUpdate = 0;
 let lastSnapshotArrival = 0;
-let snapshotInterval = 50;
+let snapshotInterval = 33.3;
 let snapshotJitter = 0;
 let rtt = 60;
 let latestMass = 0;
 let latestCellCount = 0;
+let serverTimelineServer = null;
+let serverTimelineLocal = null;
 
 const visualCells = new Map();
 const visualEjected = new Map();
@@ -110,36 +113,72 @@ function updateNetworkTiming(arrival) {
   if (lastSnapshotArrival > 0) {
     const interval = arrival - lastSnapshotArrival;
     const error = Math.abs(interval - snapshotInterval);
-    snapshotInterval = snapshotInterval * 0.88 + interval * 0.12;
-    snapshotJitter = snapshotJitter * 0.82 + error * 0.18;
+    snapshotInterval = snapshotInterval * 0.9 + interval * 0.1;
+    snapshotJitter = snapshotJitter * 0.84 + error * 0.16;
   }
   lastSnapshotArrival = arrival;
 }
 
-function updateRemote(map, id, x, y, mass, arrival, extra = {}) {
+function mapServerTime(serverNow, arrival) {
+  const value = Number(serverNow);
+  if (!Number.isFinite(value)) return arrival;
+  if (serverTimelineServer === null || serverTimelineLocal === null) {
+    serverTimelineServer = value;
+    serverTimelineLocal = arrival;
+    return arrival;
+  }
+  const mapped = serverTimelineLocal + (value - serverTimelineServer);
+  if (Math.abs(mapped - arrival) > 3000) {
+    serverTimelineServer = value;
+    serverTimelineLocal = arrival;
+    return arrival;
+  }
+  return mapped;
+}
+
+function updateRemote(map, id, x, y, mass, sampleAt, extra = {}) {
+  const sample = { at: sampleAt, x, y, mass };
   const current = map.get(id);
   if (!current) {
     map.set(id, {
       id, x, y, mass,
-      fromX: x, fromY: y, fromMass: mass, fromAt: arrival,
-      toX: x, toY: y, toMass: mass, toAt: arrival,
-      vx: 0, vy: 0,
+      history: [sample],
+      vx: 0,
+      vy: 0,
       ...extra,
     });
     return;
   }
 
-  const dt = clamp((arrival - current.toAt) / 1000, 1 / 120, 0.25);
-  current.fromX = current.toX;
-  current.fromY = current.toY;
-  current.fromMass = current.toMass;
-  current.fromAt = current.toAt;
-  current.toX = x;
-  current.toY = y;
-  current.toMass = mass;
-  current.toAt = arrival;
-  current.vx = clamp((current.toX - current.fromX) / dt, -1400, 1400);
-  current.vy = clamp((current.toY - current.fromY) / dt, -1400, 1400);
+  const history = current.history || (current.history = []);
+  const previous = history[history.length - 1];
+  if (previous && sample.at <= previous.at) sample.at = previous.at + 0.01;
+
+  if (previous) {
+    const jump = Math.hypot(sample.x - previous.x, sample.y - previous.y);
+    if (jump > 900) {
+      history.length = 0;
+      current.x = sample.x;
+      current.y = sample.y;
+      current.mass = sample.mass;
+      current.vx = 0;
+      current.vy = 0;
+    }
+  }
+
+  history.push(sample);
+  while (history.length > REMOTE_HISTORY_LIMIT) history.shift();
+
+  if (history.length >= 2) {
+    const a = history[history.length - 2];
+    const b = history[history.length - 1];
+    const dt = clamp((b.at - a.at) / 1000, 1 / 120, 0.25);
+    const measuredVx = clamp((b.x - a.x) / dt, -1400, 1400);
+    const measuredVy = clamp((b.y - a.y) / dt, -1400, 1400);
+    current.vx = current.vx * 0.5 + measuredVx * 0.5;
+    current.vy = current.vy * 0.5 + measuredVy * 0.5;
+  }
+
   Object.assign(current, extra);
 }
 
@@ -188,13 +227,13 @@ function updateOwn(cell, player, arrival) {
   current.bot = player.bot;
 }
 
-function reconcileVisuals(s, arrival) {
+function reconcileVisuals(s, arrival, sampleAt) {
   const seenCells = new Set();
   for (const player of s.players) {
     for (const cell of player.cells) {
       seenCells.add(cell.id);
       if (player.id === selfId) updateOwn(cell, player, arrival);
-      else updateRemote(visualCells, cell.id, cell.x, cell.y, cell.mass, arrival, {
+      else updateRemote(visualCells, cell.id, cell.x, cell.y, cell.mass, sampleAt, {
         ownerId: player.id,
         name: player.name,
         color: player.color,
@@ -207,14 +246,14 @@ function reconcileVisuals(s, arrival) {
   const seenEjected = new Set();
   for (const blob of s.ejected) {
     seenEjected.add(blob.id);
-    updateRemote(visualEjected, blob.id, blob.x, blob.y, blob.mass, arrival, { color: blob.color });
+    updateRemote(visualEjected, blob.id, blob.x, blob.y, blob.mass, sampleAt, { color: blob.color });
   }
   for (const id of visualEjected.keys()) if (!seenEjected.has(id)) visualEjected.delete(id);
 
   const seenViruses = new Set();
   for (const virus of s.viruses) {
     seenViruses.add(virus.id);
-    updateRemote(visualViruses, virus.id, virus.x, virus.y, virus.mass, arrival, { fed: virus.fed });
+    updateRemote(visualViruses, virus.id, virus.x, virus.y, virus.mass, sampleAt, { fed: virus.fed });
   }
   for (const id of visualViruses.keys()) if (!seenViruses.has(id)) visualViruses.delete(id);
 }
@@ -222,9 +261,10 @@ function reconcileVisuals(s, arrival) {
 function onSnapshot(s) {
   const arrival = performance.now();
   updateNetworkTiming(arrival);
+  const sampleAt = mapServerTime(s.now, arrival);
   if (!Array.isArray(s.pellets) && Array.isArray(snapshot?.pellets)) s.pellets = snapshot.pellets;
   snapshot = s;
-  reconcileVisuals(s, arrival);
+  reconcileVisuals(s, arrival, sampleAt);
 
   const me = s.players.find(player => player.id === selfId);
   const alive = !!me && me.cells.length > 0;
@@ -268,25 +308,90 @@ document.getElementById('ejectBtn').addEventListener('click', () => action('ejec
 respawnBtn.addEventListener('click', () => action('respawn'));
 
 function interpolationDelay() {
-  return clamp(snapshotInterval + snapshotJitter * 2.25, 42, 115);
+  return clamp(snapshotInterval * 2.8 + snapshotJitter * 3, 85, 160);
+}
+
+function velocityBetween(a, b) {
+  const dt = Math.max(0.001, (b.at - a.at) / 1000);
+  return {
+    x: clamp((b.x - a.x) / dt, -1400, 1400),
+    y: clamp((b.y - a.y) / dt, -1400, 1400),
+  };
+}
+
+function hermite(p1, p2, v1, v2, t, segmentSeconds) {
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const h00 = 2 * t3 - 3 * t2 + 1;
+  const h10 = t3 - 2 * t2 + t;
+  const h01 = -2 * t3 + 3 * t2;
+  const h11 = t3 - t2;
+  return {
+    x: h00 * p1.x + h10 * v1.x * segmentSeconds + h01 * p2.x + h11 * v2.x * segmentSeconds,
+    y: h00 * p1.y + h10 * v1.y * segmentSeconds + h01 * p2.y + h11 * v2.y * segmentSeconds,
+  };
 }
 
 function interpolateRemote(entity, now) {
-  const span = Math.max(1, entity.toAt - entity.fromAt);
+  const history = entity.history;
+  if (!history?.length) return;
+
   const renderAt = now - interpolationDelay();
-  const alpha = (renderAt - entity.fromAt) / span;
-  if (alpha <= 1) {
-    const t = clamp(alpha, 0, 1);
-    entity.x = entity.fromX + (entity.toX - entity.fromX) * t;
-    entity.y = entity.fromY + (entity.toY - entity.fromY) * t;
-    entity.mass = entity.fromMass + (entity.toMass - entity.fromMass) * t;
+  const first = history[0];
+  const latest = history[history.length - 1];
+
+  if (history.length === 1 || renderAt <= first.at) {
+    entity.x = first.x;
+    entity.y = first.y;
+    entity.mass = first.mass;
     return;
   }
 
-  const extra = Math.min((renderAt - entity.toAt) / 1000, 0.025);
-  entity.x = entity.toX + entity.vx * extra;
-  entity.y = entity.toY + entity.vy * extra;
-  entity.mass = entity.toMass;
+  let upperIndex = -1;
+  for (let i = 1; i < history.length; i++) {
+    if (history[i].at >= renderAt) {
+      upperIndex = i;
+      break;
+    }
+  }
+
+  if (upperIndex !== -1) {
+    const p1 = history[upperIndex - 1];
+    const p2 = history[upperIndex];
+    const p0 = history[Math.max(0, upperIndex - 2)];
+    const p3 = history[Math.min(history.length - 1, upperIndex + 1)];
+    const segmentMs = Math.max(1, p2.at - p1.at);
+    const segmentSeconds = segmentMs / 1000;
+    const t = clamp((renderAt - p1.at) / segmentMs, 0, 1);
+
+    const v1 = velocityBetween(p0, p2);
+    const v2 = velocityBetween(p1, p3);
+    const curved = hermite(p1, p2, v1, v2, t, segmentSeconds);
+    const linearX = p1.x + (p2.x - p1.x) * t;
+    const linearY = p1.y + (p2.y - p1.y) * t;
+    const curveDx = curved.x - linearX;
+    const curveDy = curved.y - linearY;
+    const curveDistance = Math.hypot(curveDx, curveDy);
+    const segmentDistance = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+    const maxCurve = Math.max(2, segmentDistance * 0.22);
+    const curveScale = curveDistance > maxCurve ? maxCurve / curveDistance : 1;
+
+    entity.x = linearX + curveDx * curveScale;
+    entity.y = linearY + curveDy * curveScale;
+    entity.mass = p1.mass + (p2.mass - p1.mass) * t;
+    return;
+  }
+
+  const overrunMs = renderAt - latest.at;
+  if (overrunMs <= 35 && history.length >= 2) {
+    const extra = overrunMs / 1000;
+    entity.x = latest.x + entity.vx * extra;
+    entity.y = latest.y + entity.vy * extra;
+  } else {
+    entity.x = latest.x;
+    entity.y = latest.y;
+  }
+  entity.mass = latest.mass;
 }
 
 function predictOwn(cell, dt, now) {
