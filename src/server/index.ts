@@ -29,8 +29,15 @@ app.use(helmet({ contentSecurityPolicy: { directives: { defaultSrc:["'self'"], c
 app.use(compression());
 app.get('/healthz', (_req, res) => res.json({ ok: true, players: [...game.players.values()].filter(p=>!p.isBot).length, bots: [...game.players.values()].filter(p=>p.isBot).length, uptime: process.uptime() }));
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../public');
-app.use(express.static(root, { maxAge: '1h', etag: true }));
-app.use((_req, res) => res.sendFile(path.join(root, 'index.html')));
+app.use(express.static(root, {
+  maxAge: 0,
+  etag: true,
+  setHeaders: res => res.setHeader('Cache-Control', 'no-cache, must-revalidate'),
+}));
+app.use((_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.sendFile(path.join(root, 'index.html'));
+});
 
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 4096, perMessageDeflate: false });
@@ -40,6 +47,8 @@ function send(ws: SocketLike, payload: unknown) {
 }
 
 wss.on('connection', (ws, req) => {
+  req.socket.setNoDelay(true);
+  req.socket.setKeepAlive(true, 15000);
   const origin = req.headers.origin;
   if (allowedOrigins.length && origin && !allowedOrigins.includes(origin)) { ws.close(1008, 'origin not allowed'); return; }
   let player: ReturnType<Game['addPlayer']> | null = null;
@@ -49,6 +58,12 @@ wss.on('connection', (ws, req) => {
   ws.on('message', raw => {
     let msg: any;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
+
+    if (msg?.type === 'ping') {
+      send(ws, { type: 'pong', clientTime: Number(msg.clientTime) || 0 });
+      return;
+    }
+
     if (!player) {
       if (msg?.type !== 'join') return;
       player = game.addPlayer(sanitizeName(msg.name));
@@ -81,8 +96,25 @@ setInterval(() => {
   game.tick(dt, Date.now());
 }, 1000 / TICK_RATE);
 
+const snapshotCounters = new WeakMap<object, number>();
 setInterval(() => {
-  for (const player of game.players.values()) if (!player.isBot && player.ws) send(player.ws, game.snapshotFor(player));
+  for (const player of game.players.values()) {
+    if (player.isBot || !player.ws) continue;
+    const socket = player.ws as WebSocket;
+    if (socket.readyState !== WebSocket.OPEN) continue;
+
+    // Never build an ever-growing queue of stale world states. If the connection
+    // is congested, dropping an intermediate snapshot is better than showing it late.
+    if (socket.bufferedAmount > 64 * 1024) continue;
+
+    const state: any = game.snapshotFor(player);
+    const count = (snapshotCounters.get(socket) ?? 0) + 1;
+    snapshotCounters.set(socket, count);
+    // Pellets are numerous and mostly static. Refresh them at 10 Hz while movement
+    // state remains at the full snapshot rate, substantially reducing JSON/network load.
+    if (count % 2 !== 1) delete state.pellets;
+    send(socket, state);
+  }
 }, 1000 / SNAPSHOT_RATE);
 
 server.listen(PORT, () => console.log(`Cell Arena listening on http://localhost:${PORT}`));
