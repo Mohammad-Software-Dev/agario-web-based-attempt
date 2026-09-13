@@ -36,6 +36,7 @@ let lastAlive = true;
 let pixelRatio = 1;
 let cameraInitialized = false;
 let backgroundGradient = null;
+let vignetteGradient = null;
 let lastUiUpdate = 0;
 let lastMinimapUpdate = 0;
 let lastSnapshotArrival = 0;
@@ -51,6 +52,7 @@ if (theme !== 'light' && theme !== 'dark') theme = matchMedia('(prefers-color-sc
 const visualCells = new Map();
 const visualEjected = new Map();
 const visualViruses = new Map();
+const colorCache = new Map();
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const radius = mass => Math.sqrt(Math.max(1, mass)) * 4;
@@ -59,19 +61,63 @@ const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[char]));
 
+function colorParts(color) {
+  const key = String(color || '#ffffff').toLowerCase();
+  const cached = colorCache.get(key);
+  if (cached) return cached;
+  let hex = key.startsWith('#') ? key.slice(1) : 'ffffff';
+  if (hex.length === 3) hex = hex.split('').map(c => c + c).join('');
+  if (!/^[0-9a-f]{6}$/i.test(hex)) hex = 'ffffff';
+  const parts = {
+    r: parseInt(hex.slice(0, 2), 16),
+    g: parseInt(hex.slice(2, 4), 16),
+    b: parseInt(hex.slice(4, 6), 16),
+  };
+  colorCache.set(key, parts);
+  return parts;
+}
+
+function mixColor(color, target, amount, alpha = 1) {
+  const c = colorParts(color);
+  const t = target === 'white' ? { r: 255, g: 255, b: 255 } : { r: 0, g: 0, b: 0 };
+  const a = clamp(amount, 0, 1);
+  const r = Math.round(c.r + (t.r - c.r) * a);
+  const g = Math.round(c.g + (t.g - c.g) * a);
+  const b = Math.round(c.b + (t.b - c.b) * a);
+  return alpha >= 1 ? `rgb(${r},${g},${b})` : `rgba(${r},${g},${b},${alpha})`;
+}
+
+function colorAlpha(color, alpha) {
+  const c = colorParts(color);
+  return `rgba(${c.r},${c.g},${c.b},${alpha})`;
+}
+
+function seededUnit(seed) {
+  const x = Math.sin(seed * 12.9898 + 78.233) * 43758.5453;
+  return x - Math.floor(x);
+}
+
 function rebuildBackground() {
   backgroundGradient = ctx.createRadialGradient(
-    innerWidth * 0.5, innerHeight * 0.45, 0,
-    innerWidth * 0.5, innerHeight * 0.45, Math.max(innerWidth, innerHeight) * 0.8,
+    innerWidth * 0.48, innerHeight * 0.38, 0,
+    innerWidth * 0.5, innerHeight * 0.5, Math.max(innerWidth, innerHeight) * 0.84,
+  );
+  vignetteGradient = ctx.createRadialGradient(
+    innerWidth * 0.5, innerHeight * 0.5, Math.min(innerWidth, innerHeight) * 0.2,
+    innerWidth * 0.5, innerHeight * 0.5, Math.max(innerWidth, innerHeight) * 0.74,
   );
   if (theme === 'light') {
-    backgroundGradient.addColorStop(0, '#f7fbff');
-    backgroundGradient.addColorStop(0.58, '#eaf3ff');
-    backgroundGradient.addColorStop(1, '#dce9f8');
+    backgroundGradient.addColorStop(0, '#fbfdff');
+    backgroundGradient.addColorStop(0.58, '#eef6ff');
+    backgroundGradient.addColorStop(1, '#dbe8f6');
+    vignetteGradient.addColorStop(0, 'rgba(255,255,255,0)');
+    vignetteGradient.addColorStop(1, 'rgba(49,91,132,.10)');
   } else {
-    backgroundGradient.addColorStop(0, '#101d45');
-    backgroundGradient.addColorStop(0.55, '#08152d');
-    backgroundGradient.addColorStop(1, '#040a18');
+    backgroundGradient.addColorStop(0, '#142653');
+    backgroundGradient.addColorStop(0.55, '#091932');
+    backgroundGradient.addColorStop(1, '#030814');
+    vignetteGradient.addColorStop(0, 'rgba(0,0,0,0)');
+    vignetteGradient.addColorStop(1, 'rgba(0,0,0,.28)');
   }
 }
 
@@ -147,7 +193,7 @@ form.addEventListener('submit', event => {
 });
 
 function sendPing() {
-  if (ws?.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({ type: 'ping', clientTime: performance.now() }));
 }
 setInterval(sendPing, PING_INTERVAL_MS);
@@ -271,8 +317,8 @@ function reconcileVisuals(s, arrival) {
 function onSnapshot(s) {
   const arrival = performance.now();
   updateNetworkTiming(arrival);
-  if (!Array.isArray(s.pellets) && Array.isArray(snapshot?.pellets)) s.pellets = snapshot.pellets;
-  if (!Array.isArray(s.minimap) && Array.isArray(snapshot?.minimap)) s.minimap = snapshot.minimap;
+  if (!Array.isArray(s.pellets) && Array.isArray(snapshot && snapshot.pellets)) s.pellets = snapshot.pellets;
+  if (!Array.isArray(s.minimap) && Array.isArray(snapshot && snapshot.minimap)) s.minimap = snapshot.minimap;
   snapshot = s;
   reconcileVisuals(s, arrival);
 
@@ -306,7 +352,7 @@ canvas.addEventListener('pointermove', event => { mouse = { x: event.clientX, y:
 canvas.addEventListener('pointerdown', event => { mouse = { x: event.clientX, y: event.clientY }; }, { passive: true });
 
 function action(type) {
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type }));
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type }));
 }
 addEventListener('keydown', event => {
   if (event.repeat) return;
@@ -457,7 +503,7 @@ function interpolationDelay() {
 
 function interpolatePassive(entity, now) {
   const history = entity.history;
-  if (!history?.length) return;
+  if (!history || !history.length) return;
   const renderAt = now - interpolationDelay();
   if (history.length === 1 || renderAt <= history[0].at) {
     entity.x = history[0].x;
@@ -485,9 +531,6 @@ function interpolatePassive(entity, now) {
 
 function advanceVisuals(dt, now) {
   for (const cell of visualCells.values()) predictPlayerCell(cell, dt, now);
-  // Prediction pulls every sibling toward the same target. Re-apply the same hard
-  // circle constraint as the server every render frame so the visual state cannot
-  // overlap between authoritative snapshots.
   resolveVisualSiblingCollisions(now);
   for (const entity of visualEjected.values()) interpolatePassive(entity, now);
   for (const entity of visualViruses.values()) interpolatePassive(entity, now);
@@ -543,9 +586,17 @@ function drawMinimap(now) {
   minimapCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
   minimapCtx.clearRect(0, 0, cssSize, cssSize);
 
-  minimapCtx.fillStyle = theme === 'light' ? 'rgba(255,255,255,.88)' : 'rgba(3,9,24,.78)';
+  const miniBg = minimapCtx.createLinearGradient(0, 0, cssSize, cssSize);
+  if (theme === 'light') {
+    miniBg.addColorStop(0, 'rgba(255,255,255,.96)');
+    miniBg.addColorStop(1, 'rgba(226,240,254,.94)');
+  } else {
+    miniBg.addColorStop(0, 'rgba(8,20,43,.94)');
+    miniBg.addColorStop(1, 'rgba(3,8,20,.92)');
+  }
+  minimapCtx.fillStyle = miniBg;
   minimapCtx.fillRect(0, 0, cssSize, cssSize);
-  minimapCtx.strokeStyle = theme === 'light' ? 'rgba(30,70,120,.18)' : 'rgba(102,247,255,.18)';
+  minimapCtx.strokeStyle = theme === 'light' ? 'rgba(30,70,120,.14)' : 'rgba(102,247,255,.12)';
   minimapCtx.lineWidth = 1;
   for (let i = 1; i < 5; i++) {
     const p = cssSize * i / 5;
@@ -559,21 +610,19 @@ function drawMinimap(now) {
     const x = entry.x * sx;
     const y = entry.y * sy;
     const isSelf = entry.id === selfId;
-    const dot = isSelf ? 5 : clamp(2.2 + Math.log10(Math.max(10, entry.mass)) * 0.7, 2.5, 4.2);
+    const dot = isSelf ? 5.5 : clamp(2.2 + Math.log10(Math.max(10, entry.mass)) * 0.7, 2.5, 4.3);
     minimapCtx.beginPath();
     minimapCtx.arc(x, y, dot, 0, Math.PI * 2);
     minimapCtx.fillStyle = entry.color || '#00e5ff';
     minimapCtx.fill();
-    if (isSelf) {
-      minimapCtx.strokeStyle = theme === 'light' ? '#17243d' : '#ffffff';
-      minimapCtx.lineWidth = 2;
-      minimapCtx.stroke();
-    }
+    minimapCtx.strokeStyle = isSelf ? (theme === 'light' ? '#13233d' : '#ffffff') : colorAlpha(entry.color || '#00e5ff', .55);
+    minimapCtx.lineWidth = isSelf ? 2 : 1;
+    minimapCtx.stroke();
   }
 
   const viewportW = Math.min(snapshot.world.width, innerWidth / camera.zoom);
   const viewportH = Math.min(snapshot.world.height, innerHeight / camera.zoom);
-  minimapCtx.strokeStyle = theme === 'light' ? 'rgba(20,50,90,.55)' : 'rgba(255,255,255,.55)';
+  minimapCtx.strokeStyle = theme === 'light' ? 'rgba(20,50,90,.58)' : 'rgba(255,255,255,.65)';
   minimapCtx.lineWidth = 1;
   minimapCtx.strokeRect(
     clamp((camera.x - viewportW / 2) * sx, 0, cssSize),
@@ -584,24 +633,31 @@ function drawMinimap(now) {
 }
 
 function drawGrid(world) {
-  const gap = 80;
-  const scaledGap = gap * camera.zoom;
+  const minorGap = 80;
+  const majorGap = 400;
   const cx = innerWidth / 2 - camera.x * camera.zoom;
   const cy = innerHeight / 2 - camera.y * camera.zoom;
   ctx.save();
-  ctx.strokeStyle = theme === 'light' ? 'rgba(35,80,130,.10)' : 'rgba(46,196,255,.10)';
-  ctx.lineWidth = 1;
-  const startX = ((cx % scaledGap) + scaledGap) % scaledGap;
-  const startY = ((cy % scaledGap) + scaledGap) % scaledGap;
-  for (let x = startX; x < innerWidth; x += scaledGap) {
-    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, innerHeight); ctx.stroke();
-  }
-  for (let y = startY; y < innerHeight; y += scaledGap) {
-    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(innerWidth, y); ctx.stroke();
-  }
-  ctx.strokeStyle = theme === 'light' ? 'rgba(23,100,180,.34)' : 'rgba(0,229,255,.42)';
-  ctx.lineWidth = 3;
+
+  const drawLines = (gap, stroke, width) => {
+    const scaledGap = gap * camera.zoom;
+    if (scaledGap < 12) return;
+    ctx.strokeStyle = stroke;
+    ctx.lineWidth = width;
+    const startX = ((cx % scaledGap) + scaledGap) % scaledGap;
+    const startY = ((cy % scaledGap) + scaledGap) % scaledGap;
+    ctx.beginPath();
+    for (let x = startX; x < innerWidth; x += scaledGap) { ctx.moveTo(x, 0); ctx.lineTo(x, innerHeight); }
+    for (let y = startY; y < innerHeight; y += scaledGap) { ctx.moveTo(0, y); ctx.lineTo(innerWidth, y); }
+    ctx.stroke();
+  };
+
+  drawLines(minorGap, theme === 'light' ? 'rgba(41,91,137,.075)' : 'rgba(63,200,255,.07)', 1);
+  drawLines(majorGap, theme === 'light' ? 'rgba(28,78,126,.115)' : 'rgba(89,219,255,.115)', 1.25);
+
   const point = toScreen(0, 0);
+  ctx.strokeStyle = theme === 'light' ? 'rgba(20,91,161,.4)' : 'rgba(0,229,255,.46)';
+  ctx.lineWidth = 3;
   ctx.strokeRect(point.x, point.y, world.width * camera.zoom, world.height * camera.zoom);
   ctx.restore();
 }
@@ -613,39 +669,237 @@ function toScreen(x, y) {
   };
 }
 
-function drawCircle(x, y, r, fill, stroke = 'rgba(255,255,255,.34)', lineWidth = 2) {
-  const point = toScreen(x, y);
-  const rr = r * camera.zoom;
-  if (point.x + rr < 0 || point.x - rr > innerWidth || point.y + rr < 0 || point.y - rr > innerHeight) return;
+function isVisible(point, rr, padding = 20) {
+  return point.x + rr + padding >= 0 && point.x - rr - padding <= innerWidth && point.y + rr + padding >= 0 && point.y - rr - padding <= innerHeight;
+}
+
+function drawPellet(pellet) {
+  const point = toScreen(pellet.x, pellet.y);
+  const rr = Math.max(2.4, 5.3 * camera.zoom);
+  if (!isVisible(point, rr, 8)) return;
+
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, rr * 1.65, 0, Math.PI * 2);
+  ctx.fillStyle = colorAlpha(pellet.color, theme === 'light' ? .10 : .16);
+  ctx.fill();
+
   ctx.beginPath();
   ctx.arc(point.x, point.y, rr, 0, Math.PI * 2);
-  ctx.fillStyle = fill;
+  ctx.fillStyle = pellet.color;
   ctx.fill();
-  if (stroke) {
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = lineWidth;
-    ctx.stroke();
+  ctx.strokeStyle = mixColor(pellet.color, 'black', .22, .34);
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  if (rr > 3.4) {
+    ctx.beginPath();
+    ctx.arc(point.x - rr * .28, point.y - rr * .3, rr * .28, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,255,255,.58)';
+    ctx.fill();
   }
 }
 
-function drawVirus(virus) {
+function drawEjected(blob) {
+  const point = toScreen(blob.x, blob.y);
+  const rr = radius(blob.mass) * camera.zoom;
+  if (!isVisible(point, rr)) return;
+
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, rr * 1.08, 0, Math.PI * 2);
+  ctx.fillStyle = mixColor(blob.color, 'black', .18, .38);
+  ctx.fill();
+
+  const grad = ctx.createRadialGradient(point.x - rr * .28, point.y - rr * .3, rr * .08, point.x, point.y, rr);
+  grad.addColorStop(0, mixColor(blob.color, 'white', .42));
+  grad.addColorStop(.58, blob.color);
+  grad.addColorStop(1, mixColor(blob.color, 'black', .24));
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, rr, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.48)';
+  ctx.lineWidth = 1.2;
+  ctx.stroke();
+}
+
+function drawVirus(virus, now) {
   const point = toScreen(virus.x, virus.y);
-  const r = radius(virus.mass) * camera.zoom;
-  const spikes = 24;
+  const rr = radius(virus.mass) * camera.zoom;
+  if (!isVisible(point, rr, 30)) return;
+  const spikes = 28;
+  const phase = (virus.id % 17) * 0.19 + now * 0.00006;
+
+  ctx.save();
+  ctx.shadowColor = theme === 'light' ? 'rgba(20,180,85,.24)' : 'rgba(45,255,119,.34)';
+  ctx.shadowBlur = Math.min(18, rr * .24);
   ctx.beginPath();
   for (let i = 0; i < spikes * 2; i++) {
-    const angle = i * Math.PI / spikes;
-    const rr = i % 2 ? r * 0.84 : r * 1.08;
-    const x = point.x + Math.cos(angle) * rr;
-    const y = point.y + Math.sin(angle) * rr;
+    const angle = phase + i * Math.PI / spikes;
+    const spike = i % 2 === 0;
+    const wave = 1 + Math.sin(i * 1.73 + virus.id) * .025;
+    const r = rr * (spike ? 1.13 : .87) * wave;
+    const x = point.x + Math.cos(angle) * r;
+    const y = point.y + Math.sin(angle) * r;
     if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
   }
   ctx.closePath();
-  ctx.fillStyle = '#20e978';
+  const grad = ctx.createRadialGradient(point.x - rr * .28, point.y - rr * .34, rr * .08, point.x, point.y, rr * 1.08);
+  grad.addColorStop(0, '#9dff8f');
+  grad.addColorStop(.36, '#28ee70');
+  grad.addColorStop(.78, '#08ad51');
+  grad.addColorStop(1, '#05743b');
+  ctx.fillStyle = grad;
   ctx.fill();
-  ctx.strokeStyle = theme === 'light' ? '#08753a' : '#b7ffd1';
-  ctx.lineWidth = 2;
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = theme === 'light' ? '#06713c' : '#baffc9';
+  ctx.lineWidth = Math.max(1.5, rr * .045);
   ctx.stroke();
+
+  ctx.clip();
+  for (let i = 0; i < 6; i++) {
+    const a = seededUnit(virus.id * 31 + i) * Math.PI * 2;
+    const d = rr * (.18 + seededUnit(virus.id * 47 + i) * .46);
+    const br = rr * (.055 + seededUnit(virus.id * 59 + i) * .045);
+    ctx.beginPath();
+    ctx.arc(point.x + Math.cos(a) * d, point.y + Math.sin(a) * d, br, 0, Math.PI * 2);
+    ctx.fillStyle = i % 2 ? 'rgba(1,86,44,.22)' : 'rgba(220,255,224,.24)';
+    ctx.fill();
+  }
+  ctx.restore();
+
+  const fed = Math.max(0, Math.min(7, Number(virus.fed) || 0));
+  if (fed > 0 && rr > 18) {
+    for (let i = 0; i < fed; i++) {
+      const angle = -Math.PI / 2 + i * (Math.PI * 2 / 7);
+      ctx.beginPath();
+      ctx.arc(point.x + Math.cos(angle) * rr * .58, point.y + Math.sin(angle) * rr * .58, Math.max(1.5, rr * .035), 0, Math.PI * 2);
+      ctx.fillStyle = '#f2ff55';
+      ctx.fill();
+    }
+  }
+}
+
+function drawCellSurface(cell, point, rr, isSelf) {
+  const color = cell.color || '#00e5ff';
+  if (rr < 9) {
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, rr, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+    ctx.strokeStyle = isSelf ? 'rgba(255,255,255,.92)' : mixColor(color, 'black', .28, .72);
+    ctx.lineWidth = isSelf ? 2 : 1.5;
+    ctx.stroke();
+    return;
+  }
+
+  ctx.save();
+  ctx.shadowColor = theme === 'light' ? 'rgba(36,62,91,.20)' : 'rgba(0,0,0,.35)';
+  ctx.shadowBlur = Math.min(17, rr * .16);
+  ctx.shadowOffsetY = Math.min(5, rr * .05);
+
+  const grad = ctx.createRadialGradient(
+    point.x - rr * .30, point.y - rr * .34, Math.max(1, rr * .06),
+    point.x + rr * .06, point.y + rr * .08, rr * 1.06,
+  );
+  grad.addColorStop(0, mixColor(color, 'white', .40));
+  grad.addColorStop(.30, mixColor(color, 'white', .13));
+  grad.addColorStop(.68, color);
+  grad.addColorStop(1, mixColor(color, 'black', .34));
+
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, rr, 0, Math.PI * 2);
+  ctx.fillStyle = grad;
+  ctx.fill();
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetY = 0;
+
+  ctx.strokeStyle = mixColor(color, 'black', theme === 'light' ? .34 : .28, .82);
+  ctx.lineWidth = Math.max(1.5, Math.min(4, rr * .055));
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, Math.max(1, rr - ctx.lineWidth * 1.25), 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(255,255,255,.22)';
+  ctx.lineWidth = Math.max(1, rr * .025);
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(point.x, point.y, rr * .96, 0, Math.PI * 2);
+  ctx.clip();
+
+  const highlight = ctx.createRadialGradient(
+    point.x - rr * .34, point.y - rr * .40, 0,
+    point.x - rr * .28, point.y - rr * .33, rr * .72,
+  );
+  highlight.addColorStop(0, 'rgba(255,255,255,.34)');
+  highlight.addColorStop(.42, 'rgba(255,255,255,.10)');
+  highlight.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = highlight;
+  ctx.fillRect(point.x - rr, point.y - rr, rr * 2, rr * 2);
+
+  if (rr > 24) {
+    const detailCount = rr > 55 ? 4 : 2;
+    for (let i = 0; i < detailCount; i++) {
+      const angle = seededUnit(cell.id * 29 + i * 11) * Math.PI * 2;
+      const distance = rr * (.18 + seededUnit(cell.id * 41 + i * 7) * .42);
+      const size = rr * (.045 + seededUnit(cell.id * 53 + i * 13) * .035);
+      ctx.beginPath();
+      ctx.arc(point.x + Math.cos(angle) * distance, point.y + Math.sin(angle) * distance, size, 0, Math.PI * 2);
+      ctx.fillStyle = i % 2 ? 'rgba(255,255,255,.085)' : 'rgba(0,0,0,.07)';
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+
+  if (isSelf) {
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, rr + Math.max(1.5, rr * .025), 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,255,255,.88)';
+    ctx.lineWidth = Math.max(2, Math.min(3.5, rr * .045));
+    ctx.shadowColor = colorAlpha(color, .55);
+    ctx.shadowBlur = Math.min(12, rr * .11);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+function drawCellLabel(cell, point, rr) {
+  if (rr <= 18) return;
+  const fontSize = Math.max(10, Math.min(24, rr * .31));
+  const massSize = Math.max(9, Math.min(15, rr * .19));
+  const yOffset = rr > 34 ? -6 : 0;
+
+  ctx.save();
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = `800 ${fontSize}px system-ui,-apple-system,sans-serif`;
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = Math.max(2.5, fontSize * .18);
+  ctx.strokeStyle = 'rgba(0,0,0,.38)';
+  ctx.strokeText(cell.name, point.x, point.y + yOffset);
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(cell.name, point.x, point.y + yOffset);
+
+  if (rr > 34) {
+    ctx.font = `750 ${massSize}px system-ui,-apple-system,sans-serif`;
+    ctx.lineWidth = Math.max(2, massSize * .17);
+    ctx.strokeStyle = 'rgba(0,0,0,.34)';
+    ctx.strokeText(String(Math.round(cell.mass)), point.x, point.y + 14);
+    ctx.fillStyle = 'rgba(255,255,255,.90)';
+    ctx.fillText(String(Math.round(cell.mass)), point.x, point.y + 14);
+  }
+  ctx.restore();
+}
+
+function drawCell(cell) {
+  const r = radius(cell.mass);
+  const point = toScreen(cell.x, cell.y);
+  const rr = r * camera.zoom;
+  if (!isVisible(point, rr, 24)) return;
+  const isSelf = cell.ownerId === selfId;
+  drawCellSurface(cell, point, rr, isSelf);
+  drawCellLabel(cell, point, rr);
 }
 
 function draw() {
@@ -661,39 +915,22 @@ function draw() {
   drawMinimap(now);
 
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-  ctx.fillStyle = backgroundGradient || (theme === 'light' ? '#eaf3ff' : '#040a18');
+  ctx.fillStyle = backgroundGradient || (theme === 'light' ? '#eef6ff' : '#030814');
   ctx.fillRect(0, 0, innerWidth, innerHeight);
 
   if (snapshot) {
     drawGrid(snapshot.world);
-    for (const pellet of snapshot.pellets || []) drawCircle(pellet.x, pellet.y, 5.3, pellet.color, null, 0);
-    for (const blob of visualEjected.values()) drawCircle(blob.x, blob.y, radius(blob.mass), blob.color, 'rgba(255,255,255,.55)', 1.25);
-    for (const virus of visualViruses.values()) drawVirus(virus);
+    for (const pellet of snapshot.pellets || []) drawPellet(pellet);
+    for (const blob of visualEjected.values()) drawEjected(blob);
+    for (const virus of visualViruses.values()) drawVirus(virus, now);
 
     const ordered = Array.from(visualCells.values()).sort((a, b) => b.mass - a.mass);
-    for (const cell of ordered) {
-      const r = radius(cell.mass);
-      const isSelf = cell.ownerId === selfId;
-      drawCircle(cell.x, cell.y, r, cell.color, isSelf ? '#ffffff' : 'rgba(255,255,255,.42)', isSelf ? 3 : 2);
-      const point = toScreen(cell.x, cell.y);
-      const rr = r * camera.zoom;
-      if (rr > 18) {
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillStyle = '#ffffff';
-        ctx.shadowColor = 'rgba(0,0,0,.62)';
-        ctx.shadowBlur = 4;
-        ctx.font = `800 ${Math.max(10, Math.min(24, rr * 0.32))}px system-ui`;
-        ctx.fillText(cell.name, point.x, point.y - (rr > 34 ? 6 : 0));
-        if (rr > 34) {
-          ctx.font = `700 ${Math.max(9, Math.min(15, rr * 0.2))}px system-ui`;
-          ctx.globalAlpha = 0.86;
-          ctx.fillText(Math.round(cell.mass), point.x, point.y + 14);
-          ctx.globalAlpha = 1;
-        }
-        ctx.shadowBlur = 0;
-      }
-    }
+    for (const cell of ordered) drawCell(cell);
+  }
+
+  if (vignetteGradient) {
+    ctx.fillStyle = vignetteGradient;
+    ctx.fillRect(0, 0, innerWidth, innerHeight);
   }
 
   requestAnimationFrame(draw);
