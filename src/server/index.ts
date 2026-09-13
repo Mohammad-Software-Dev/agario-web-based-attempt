@@ -14,7 +14,7 @@ const num = (name: string, fallback: number) => {
 };
 const PORT = num('PORT', 3000);
 const TICK_RATE = Math.min(60, num('TICK_RATE', 30));
-const SNAPSHOT_RATE = Math.min(TICK_RATE, num('SNAPSHOT_RATE', 20));
+const SNAPSHOT_RATE = Math.min(TICK_RATE, num('SNAPSHOT_RATE', 30));
 const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '').split(',').map(v => v.trim()).filter(Boolean);
 
 const game = new Game({
@@ -97,6 +97,7 @@ setInterval(() => {
 }, 1000 / TICK_RATE);
 
 const snapshotCounters = new WeakMap<object, number>();
+const pelletStride = Math.max(1, Math.round(SNAPSHOT_RATE / 10));
 setInterval(() => {
   for (const player of game.players.values()) {
     if (player.isBot || !player.ws) continue;
@@ -110,9 +111,9 @@ setInterval(() => {
     const state: any = game.snapshotFor(player);
     const count = (snapshotCounters.get(socket) ?? 0) + 1;
     snapshotCounters.set(socket, count);
-    // Pellets are numerous and mostly static. Refresh them at 10 Hz while movement
-    // state remains at the full snapshot rate, substantially reducing JSON/network load.
-    if (count % 2 !== 1) delete state.pellets;
+    // Pellets are numerous and mostly static. Refresh them around 10 Hz while
+    // movement state follows the simulation tick rate for smoother remote motion.
+    if ((count - 1) % pelletStride !== 0) delete state.pellets;
     send(socket, state);
   }
 }, 1000 / SNAPSHOT_RATE);
