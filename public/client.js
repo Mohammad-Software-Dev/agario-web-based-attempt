@@ -22,6 +22,8 @@ const PING_INTERVAL_MS = 1500;
 const UI_INTERVAL_MS = 200;
 const MINIMAP_INTERVAL_MS = 100;
 const REMOTE_HISTORY_LIMIT = 10;
+const SIBLING_PADDING = 0.75;
+const SIBLING_SOLVER_PASSES = 8;
 
 let ws = null;
 let snapshot = null;
@@ -198,6 +200,7 @@ function newPredictedCell(cell, player, arrival) {
     predictedVx: Number(cell.vx) || 0,
     predictedVy: Number(cell.vy) || 0,
     boostUntilLocal: arrival + Math.max(0, Number(cell.boostMs) || 0),
+    mergeUntilLocal: arrival + Math.max(0, Number(cell.mergeMs) || 0),
     targetX: Number(player.target?.x) || cell.x,
     targetY: Number(player.target?.y) || cell.y,
   };
@@ -228,6 +231,7 @@ function updatePredictedCell(cell, player, arrival) {
   current.name = player.name;
   current.color = player.color;
   current.bot = player.bot;
+  current.mergeUntilLocal = arrival + Math.max(0, Number(cell.mergeMs) || 0);
 
   const boostMs = Math.max(0, Number(cell.boostMs) || 0);
   if (boostMs > 0) {
@@ -369,9 +373,6 @@ function predictPlayerCell(cell, dt, now) {
     }
   }
 
-  // All player/bot cells use the same prediction and reconciliation constants.
-  // The server snapshot is projected forward by estimated one-way latency before
-  // correcting, so remote cells do not get pulled backwards toward stale samples.
   const horizon = clamp(rtt / 2000 + snapshotInterval / 2000, 0.012, 0.105);
   const projected = projectServerState(cell, horizon, now);
   const errorX = projected.x - cell.x;
@@ -386,6 +387,67 @@ function predictPlayerCell(cell, dt, now) {
     const r = radius(cell.mass);
     cell.x = clamp(cell.x, r + WORLD_MARGIN, snapshot.world.width - r - WORLD_MARGIN);
     cell.y = clamp(cell.y, r + WORLD_MARGIN, snapshot.world.height - r - WORLD_MARGIN);
+  }
+}
+
+function resolveVisualSiblingCollisions(now) {
+  if (!snapshot || visualCells.size < 2) return;
+  const byOwner = new Map();
+  for (const cell of visualCells.values()) {
+    let group = byOwner.get(cell.ownerId);
+    if (!group) {
+      group = [];
+      byOwner.set(cell.ownerId, group);
+    }
+    group.push(cell);
+  }
+
+  for (const cells of byOwner.values()) {
+    if (cells.length < 2) continue;
+    for (let pass = 0; pass < SIBLING_SOLVER_PASSES; pass++) {
+      let corrected = false;
+      for (let i = 0; i < cells.length; i++) {
+        const a = cells[i];
+        for (let j = i + 1; j < cells.length; j++) {
+          const b = cells[j];
+          if (now >= a.mergeUntilLocal && now >= b.mergeUntilLocal) continue;
+
+          const ar = radius(a.mass);
+          const br = radius(b.mass);
+          const minDistance = ar + br + SIBLING_PADDING;
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          let distance = Math.hypot(dx, dy);
+          if (distance >= minDistance) continue;
+
+          let nx;
+          let ny;
+          if (distance < 0.0001) {
+            const angle = (((a.id * 0.754877666 + b.id * 0.569840296 + pass * 0.17320508) % 1) + 1) % 1 * Math.PI * 2;
+            nx = Math.cos(angle);
+            ny = Math.sin(angle);
+            distance = 0;
+          } else {
+            nx = dx / distance;
+            ny = dy / distance;
+          }
+
+          const overlap = minDistance - distance;
+          const totalRadius = Math.max(0.0001, ar + br);
+          a.x -= nx * overlap * (br / totalRadius);
+          a.y -= ny * overlap * (br / totalRadius);
+          b.x += nx * overlap * (ar / totalRadius);
+          b.y += ny * overlap * (ar / totalRadius);
+
+          a.x = clamp(a.x, ar + WORLD_MARGIN, snapshot.world.width - ar - WORLD_MARGIN);
+          a.y = clamp(a.y, ar + WORLD_MARGIN, snapshot.world.height - ar - WORLD_MARGIN);
+          b.x = clamp(b.x, br + WORLD_MARGIN, snapshot.world.width - br - WORLD_MARGIN);
+          b.y = clamp(b.y, br + WORLD_MARGIN, snapshot.world.height - br - WORLD_MARGIN);
+          corrected = true;
+        }
+      }
+      if (!corrected) break;
+    }
   }
 }
 
@@ -423,6 +485,10 @@ function interpolatePassive(entity, now) {
 
 function advanceVisuals(dt, now) {
   for (const cell of visualCells.values()) predictPlayerCell(cell, dt, now);
+  // Prediction pulls every sibling toward the same target. Re-apply the same hard
+  // circle constraint as the server every render frame so the visual state cannot
+  // overlap between authoritative snapshots.
+  resolveVisualSiblingCollisions(now);
   for (const entity of visualEjected.values()) interpolatePassive(entity, now);
   for (const entity of visualViruses.values()) interpolatePassive(entity, now);
 }
