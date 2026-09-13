@@ -1,22 +1,36 @@
-import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it } from 'vitest';
 import { Game } from './game.js';
 import { GAME } from '../shared/constants.js';
 
-const makeGame = () => new Game({ worldWidth: 2000, worldHeight: 2000, foodCount: 0, virusCount: 0, botCount: 0, tickRate: 30, snapshotRate: 15 });
+const makeGame = () => new Game({ worldWidth: 2000, worldHeight: 2000, foodCount: 0, virusCount: 0, botCount: 0, tickRate: 30, snapshotRate: 30 });
 
 describe('Game mechanics', () => {
   it('splits an eligible cell into two while preserving mass', () => {
-    const game = makeGame(); const p = game.addPlayer('A'); p.cells[0]!.mass = 100; p.target={x:p.cells[0]!.x+500,y:p.cells[0]!.y};
+    const game = makeGame(); const p = game.addPlayer('A'); p.cells[0]!.mass = 100; p.target = { x: p.cells[0]!.x + 500, y: p.cells[0]!.y };
     const before = game.totalMass(p); game.split(p, 1000);
     expect(p.cells).toHaveLength(2); expect(game.totalMass(p)).toBeCloseTo(before, 8);
   });
+
+  it('keeps sibling cells from overlapping before their merge cooldown', () => {
+    const game = makeGame(); const p = game.addPlayer('A'); const source = p.cells[0]!;
+    source.mass = 100; p.target = { x: source.x + 500, y: source.y };
+    game.split(p, 1000);
+    game.tick(1 / 30, 1033);
+    expect(p.cells).toHaveLength(2);
+    const [a, b] = p.cells;
+    const distance = Math.hypot(a!.x - b!.x, a!.y - b!.y);
+    const minimum = Math.sqrt(a!.mass) * 4 + Math.sqrt(b!.mass) * 4;
+    expect(distance).toBeGreaterThanOrEqual(minimum - 0.75);
+  });
+
   it('will not exceed the 16 cell cap', () => {
     const game = makeGame(); const p = game.addPlayer('A'); p.cells[0]!.mass = 10000;
-    let now=1000; for(let i=0;i<8;i++){ game.split(p, now); now += GAME.splitCooldownMs+1; }
+    let now = 1000; for (let i = 0; i < 8; i++) { game.split(p, now); now += GAME.splitCooldownMs + 1; }
     expect(p.cells.length).toBeLessThanOrEqual(GAME.maxCellsPerPlayer);
   });
+
   it('ejection spends more mass than it creates', () => {
-    const game = makeGame(); const p = game.addPlayer('A'); p.cells[0]!.mass=100; p.target={x:p.cells[0]!.x+100,y:p.cells[0]!.y};
+    const game = makeGame(); const p = game.addPlayer('A'); p.cells[0]!.mass = 100; p.target = { x: p.cells[0]!.x + 100, y: p.cells[0]!.y };
     game.eject(p, 1000); expect(p.cells[0]!.mass).toBe(82); expect([...game.ejected.values()][0]!.mass).toBe(13);
   });
 
@@ -29,8 +43,16 @@ describe('Game mechanics', () => {
     expect(c.y).toBeLessThanOrEqual(2000 - r);
   });
 
+  it('includes movement targets and compact minimap data in snapshots', () => {
+    const game = makeGame(); const p = game.addPlayer('A'); p.target = { x: 1200, y: 800 };
+    const state = game.snapshotFor(p);
+    expect(state.players[0]!.target).toEqual({ x: 1200, y: 800 });
+    expect(state.players[0]!.cells[0]).toMatchObject({ vx: 0, vy: 0, boostMs: 0 });
+    expect(state.minimap.some(entry => entry.id === p.id)).toBe(true);
+  });
+
   it('respawns dead players', () => {
-    const game = makeGame(); const p = game.addPlayer('A'); p.cells=[]; p.alive=false; game.respawn(p);
+    const game = makeGame(); const p = game.addPlayer('A'); p.cells = []; p.alive = false; game.respawn(p);
     expect(p.alive).toBe(true); expect(p.cells).toHaveLength(1);
   });
 });
