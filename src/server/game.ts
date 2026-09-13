@@ -113,12 +113,15 @@ export class Game {
     const additions: Cell[] = [];
     for (const cell of original) {
       if (slots <= 0 || cell.mass < GAME.minSplitMass) continue;
-      const dir = normalize({ x: player.target.x - cell.x, y: player.target.y - cell.y });
+      let dir = normalize({ x: player.target.x - cell.x, y: player.target.y - cell.y });
+      if (Math.abs(dir.x) + Math.abs(dir.y) < 0.0001) dir = { x: 1, y: 0 };
       const half = cell.mass / 2;
       cell.mass = half;
       cell.canMergeAt = now + GAME.mergeBaseMs + half * GAME.mergeMassFactorMs;
       const r = radiusFromMass(half);
-      const child = this.createCell(player.id, cell.x + dir.x * r * 0.6, cell.y + dir.y * r * 0.6, half);
+      // Start the launched half clearly in front of the parent. The rigid collision
+      // pass below guarantees sibling cells remain tangent rather than overlapping.
+      const child = this.createCell(player.id, cell.x + dir.x * r * 1.15, cell.y + dir.y * r * 1.15, half);
       child.vx = dir.x * GAME.splitBoostSpeed;
       child.vy = dir.y * GAME.splitBoostSpeed;
       child.boostUntil = now + GAME.splitBoostMs;
@@ -128,6 +131,7 @@ export class Game {
     }
     player.cells.push(...additions);
     player.lastSplitAt = now;
+    this.resolveOwnCellCollisions(1 / Math.max(1, this.config.tickRate), now);
   }
 
   eject(player: Player, now = Date.now()) {
@@ -151,11 +155,15 @@ export class Game {
   tick(dt: number, now = Date.now()) {
     this.updateBots(now);
     this.moveDynamic(dt, now);
+    this.resolveOwnCellCollisions(dt, now);
     this.consumePellets();
     this.consumeEjected();
     this.feedViruses();
     this.consumeViruses(now);
     this.consumePlayers();
+    // Growth, virus pops and eating can change radii inside this tick, so resolve
+    // sibling rigid collisions again before allowing merge-ready cells to combine.
+    this.resolveOwnCellCollisions(dt, now);
     this.mergeOwnCells(now);
     this.decayMass(dt);
     this.clampCellsToWorld();
@@ -197,6 +205,64 @@ export class Game {
       if (virus.y < 45 || virus.y > this.config.worldHeight - 45) virus.vy *= -0.7;
       virus.x = clamp(virus.x, 40, this.config.worldWidth - 40);
       virus.y = clamp(virus.y, 40, this.config.worldHeight - 40);
+    }
+  }
+
+  /**
+   * Resolve rigid collisions between cells owned by the same player while they
+   * are still on merge cooldown. For two circles, penetration is
+   *   overlap = r1 + r2 - distance.
+   * We separate along the center normal and distribute displacement by the
+   * opposite radius, which makes the smaller cell move more than the larger.
+   */
+  private resolveOwnCellCollisions(dt: number, now: number) {
+    const response = clamp(dt * 48, 0, 1);
+    if (response <= 0) return;
+
+    for (const player of this.players.values()) {
+      const cells = player.cells;
+      for (let i = 0; i < cells.length; i++) {
+        const a = cells[i]; if (!a) continue;
+        for (let j = i + 1; j < cells.length; j++) {
+          const b = cells[j]; if (!b) continue;
+          // Once both timers have elapsed they must be allowed to overlap so the
+          // merge rule can bring them back into one cell.
+          if (now >= a.canMergeAt && now >= b.canMergeAt) continue;
+
+          const ar = radiusFromMass(a.mass);
+          const br = radiusFromMass(b.mass);
+          const minDistance = ar + br;
+          let dx = b.x - a.x;
+          let dy = b.y - a.y;
+          let distance = Math.hypot(dx, dy);
+          if (distance >= minDistance) continue;
+
+          if (distance < 0.0001) {
+            // Deterministic fallback direction prevents NaNs for virus-pop cells
+            // that can be created on almost identical coordinates.
+            const angle = ((a.id * 0.754877666 + b.id * 0.569840296) % 1) * Math.PI * 2;
+            dx = Math.cos(angle);
+            dy = Math.sin(angle);
+            distance = 1;
+          }
+
+          const overlap = minDistance - distance;
+          const nx = dx / distance;
+          const ny = dy / distance;
+          const totalRadius = Math.max(0.0001, ar + br);
+          const moveA = overlap * (br / totalRadius) * response;
+          const moveB = overlap * (ar / totalRadius) * response;
+          a.x -= nx * moveA;
+          a.y -= ny * moveA;
+          b.x += nx * moveB;
+          b.y += ny * moveB;
+
+          a.x = clamp(a.x, ar + GAME.worldMargin, this.config.worldWidth - ar - GAME.worldMargin);
+          a.y = clamp(a.y, ar + GAME.worldMargin, this.config.worldHeight - ar - GAME.worldMargin);
+          b.x = clamp(b.x, br + GAME.worldMargin, this.config.worldWidth - br - GAME.worldMargin);
+          b.y = clamp(b.y, br + GAME.worldMargin, this.config.worldHeight - br - GAME.worldMargin);
+        }
+      }
     }
   }
 
@@ -269,9 +335,10 @@ export class Game {
     const each = cell.mass / count;
     cell.mass = each;
     cell.canMergeAt = now + GAME.mergeBaseMs + each * GAME.mergeMassFactorMs;
+    const r = radiusFromMass(each);
     for (let i = 1; i < count; i++) {
       const angle = (Math.PI * 2 * i) / count + Math.random() * 0.2;
-      const child = this.createCell(player.id, cell.x, cell.y, each);
+      const child = this.createCell(player.id, cell.x + Math.cos(angle) * r * 0.45, cell.y + Math.sin(angle) * r * 0.45, each);
       child.vx = Math.cos(angle) * GAME.splitBoostSpeed * 0.75;
       child.vy = Math.sin(angle) * GAME.splitBoostSpeed * 0.75;
       child.boostUntil = now + GAME.splitBoostMs * 0.8;
@@ -396,6 +463,7 @@ export class Game {
   }
 
   totalMass(player: Player) { return player.cells.reduce((sum, c) => sum + c.mass, 0); }
+
   getCenter(player: Player): Vec2 | null {
     const total = this.totalMass(player); if (!total) return null;
     return {
@@ -409,16 +477,46 @@ export class Game {
     const totalMass = Math.max(GAME.startMass, this.totalMass(player));
     const range = GAME.snapshotRadiusBase + Math.sqrt(totalMass) * 18;
     const inRange = (p: Vec2) => Math.abs(p.x - center.x) <= range && Math.abs(p.y - center.y) <= range;
-    const leaderboard = [...this.players.values()].filter(p => p.alive).map(p => ({ id: p.id, name: p.name, mass: Math.round(this.totalMass(p)), bot: p.isBot })).sort((a,b) => b.mass-a.mass).slice(0, 10);
+    const now = Date.now();
+    const leaderboard = [...this.players.values()]
+      .filter(p => p.alive)
+      .map(p => ({ id: p.id, name: p.name, mass: Math.round(this.totalMass(p)), bot: p.isBot }))
+      .sort((a, b) => b.mass - a.mass)
+      .slice(0, 10);
+    const minimap = [...this.players.values()]
+      .filter(p => p.alive)
+      .flatMap(p => {
+        const c = this.getCenter(p);
+        return c ? [{ id: p.id, x: Math.round(c.x), y: Math.round(c.y), mass: Math.round(this.totalMass(p)), color: p.color, bot: p.isBot }] : [];
+      });
+
     return {
       type: 'snapshot',
-      now: Date.now(),
+      now,
       selfId: player.id,
       world: { width: this.config.worldWidth, height: this.config.worldHeight },
-      players: [...this.players.values()].filter(p => p.alive && p.cells.some(inRange)).map(p => ({ id: p.id, name: p.name, color: p.color, bot: p.isBot, cells: p.cells.filter(inRange).map(c => ({ id: c.id, x: Math.round(c.x*10)/10, y: Math.round(c.y*10)/10, mass: Math.round(c.mass*10)/10 })) })),
+      players: [...this.players.values()]
+        .filter(p => p.alive && p.cells.some(inRange))
+        .map(p => ({
+          id: p.id,
+          name: p.name,
+          color: p.color,
+          bot: p.isBot,
+          target: { x: Math.round(p.target.x * 10) / 10, y: Math.round(p.target.y * 10) / 10 },
+          cells: p.cells.filter(inRange).map(c => ({
+            id: c.id,
+            x: Math.round(c.x * 10) / 10,
+            y: Math.round(c.y * 10) / 10,
+            mass: Math.round(c.mass * 10) / 10,
+            vx: Math.round(c.vx * 10) / 10,
+            vy: Math.round(c.vy * 10) / 10,
+            boostMs: Math.max(0, c.boostUntil - now),
+          })),
+        })),
       pellets: [...this.pellets.values()].filter(inRange),
-      viruses: [...this.viruses.values()].filter(inRange).map(v => ({ id:v.id,x:v.x,y:v.y,mass:v.mass,fed:v.fed })),
-      ejected: [...this.ejected.values()].filter(inRange).map(e => ({ id:e.id,x:e.x,y:e.y,mass:e.mass,color:e.color })),
+      viruses: [...this.viruses.values()].filter(inRange).map(v => ({ id: v.id, x: v.x, y: v.y, mass: v.mass, fed: v.fed })),
+      ejected: [...this.ejected.values()].filter(inRange).map(e => ({ id: e.id, x: e.x, y: e.y, mass: e.mass, color: e.color })),
+      minimap,
       leaderboard,
     };
   }
