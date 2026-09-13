@@ -281,14 +281,15 @@ export class Game {
   }
 
   private consumePlayers() {
-    const all = [...this.players.values()].flatMap(p => p.cells.map(c => ({ player: p, cell: c })));
+    type CellRef = { player: Player; cell: Cell };
+    const all: CellRef[] = [...this.players.values()].flatMap(p => p.cells.map(c => ({ player: p, cell: c })));
     const eaten = new Set<number>();
     for (let i = 0; i < all.length; i++) {
       const a = all[i]; if (!a || eaten.has(a.cell.id)) continue;
       for (let j = i + 1; j < all.length; j++) {
         const b = all[j]; if (!b || eaten.has(b.cell.id) || a.player.id === b.player.id) continue;
-        const eater = a.cell.mass >= b.cell.mass ? a : b;
-        const prey = eater === a ? b : a;
+        const eater: CellRef = a.cell.mass >= b.cell.mass ? a : b;
+        const prey: CellRef = eater === a ? b : a;
         const ratio = eater.cell.mass / Math.max(1, prey.cell.mass);
         const required = eater.player.cells.length > 1 ? GAME.splitEatRatio : GAME.eatRatio;
         if (ratio < required) continue;
