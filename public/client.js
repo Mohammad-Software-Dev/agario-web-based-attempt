@@ -11,6 +11,12 @@ const deathScore = document.getElementById('deathScore');
 const respawnBtn = document.getElementById('respawn');
 const mobileControls = document.getElementById('mobileControls');
 
+const BASE_SPEED = 420;
+const WORLD_MARGIN = 8;
+const INPUT_HZ = 45;
+const PING_INTERVAL_MS = 1500;
+const UI_INTERVAL_MS = 250;
+
 let ws = null;
 let snapshot = null;
 let selfId = null;
@@ -18,12 +24,17 @@ let joined = false;
 let mouse = { x: innerWidth / 2, y: innerHeight / 2 };
 let camera = { x: 3500, y: 3500, zoom: 1 };
 let lastFrame = performance.now();
-let lastSnapshotArrival = performance.now();
-let fps = 60;
 let lastAlive = true;
 let pixelRatio = 1;
 let cameraInitialized = false;
 let backgroundGradient = null;
+let lastUiUpdate = 0;
+let lastSnapshotArrival = 0;
+let snapshotInterval = 50;
+let snapshotJitter = 0;
+let rtt = 60;
+let latestMass = 0;
+let latestCellCount = 0;
 
 const visualCells = new Map();
 const visualEjected = new Map();
@@ -31,14 +42,16 @@ const visualViruses = new Map();
 
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 const radius = mass => Math.sqrt(Math.max(1, mass)) * 4;
+const speedFromMass = mass => BASE_SPEED / Math.pow(Math.max(10, mass), 0.12);
 const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[char]));
 
 function resize() {
   const coarse = matchMedia('(pointer: coarse)').matches;
-  const pixelBudgetCap = Math.sqrt(4_500_000 / Math.max(1, innerWidth * innerHeight));
-  pixelRatio = Math.max(1, Math.min(devicePixelRatio || 1, coarse ? 1.5 : 2, pixelBudgetCap));
+  const area = Math.max(1, innerWidth * innerHeight);
+  const pixelBudgetCap = Math.sqrt((coarse ? 3_000_000 : 4_500_000) / area);
+  pixelRatio = clamp(Math.min(devicePixelRatio || 1, coarse ? 1.5 : 2, pixelBudgetCap), 0.75, 2);
   canvas.width = Math.max(1, Math.floor(innerWidth * pixelRatio));
   canvas.height = Math.max(1, Math.floor(innerHeight * pixelRatio));
   canvas.style.width = `${innerWidth}px`;
@@ -55,7 +68,10 @@ resize();
 function connect(name) {
   const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${protocol}://${location.host}/ws`);
-  ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'join', name })));
+  ws.addEventListener('open', () => {
+    ws.send(JSON.stringify({ type: 'join', name }));
+    sendPing();
+  });
   ws.addEventListener('message', event => {
     let message;
     try { message = JSON.parse(event.data); } catch { return; }
@@ -65,6 +81,12 @@ function connect(name) {
       menu.classList.add('hidden');
       hud.classList.remove('hidden');
       if (matchMedia('(pointer: coarse)').matches) mobileControls.classList.remove('hidden');
+      return;
+    }
+    if (message.type === 'pong') {
+      const sample = performance.now() - Number(message.clientTime || 0);
+      if (Number.isFinite(sample) && sample >= 0 && sample < 5000) rtt = rtt * 0.8 + sample * 0.2;
+      return;
     }
     if (message.type === 'snapshot') onSnapshot(message);
   });
@@ -78,49 +100,101 @@ form.addEventListener('submit', event => {
   connect(nameInput.value || 'Cell');
 });
 
-function updateVisual(map, id, x, y, mass, serverNow, extra = {}) {
+function sendPing() {
+  if (ws?.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify({ type: 'ping', clientTime: performance.now() }));
+}
+setInterval(sendPing, PING_INTERVAL_MS);
+
+function updateNetworkTiming(arrival) {
+  if (lastSnapshotArrival > 0) {
+    const interval = arrival - lastSnapshotArrival;
+    const error = Math.abs(interval - snapshotInterval);
+    snapshotInterval = snapshotInterval * 0.88 + interval * 0.12;
+    snapshotJitter = snapshotJitter * 0.82 + error * 0.18;
+  }
+  lastSnapshotArrival = arrival;
+}
+
+function updateRemote(map, id, x, y, mass, arrival, extra = {}) {
   const current = map.get(id);
   if (!current) {
-    map.set(id, { id, x, y, mass, tx: x, ty: y, tmass: mass, vx: 0, vy: 0, serverNow, ...extra });
+    map.set(id, {
+      id, x, y, mass,
+      fromX: x, fromY: y, fromMass: mass, fromAt: arrival,
+      toX: x, toY: y, toMass: mass, toAt: arrival,
+      vx: 0, vy: 0,
+      ...extra,
+    });
     return;
   }
 
-  const elapsed = clamp((serverNow - current.serverNow) / 1000, 1 / 120, 0.25);
-  const dx = x - current.tx;
-  const dy = y - current.ty;
-  const jump = Math.hypot(dx, dy);
-
-  if (jump > 700) {
-    current.x = x;
-    current.y = y;
-    current.vx = 0;
-    current.vy = 0;
-  } else {
-    const measuredVx = dx / elapsed;
-    const measuredVy = dy / elapsed;
-    current.vx = current.vx * 0.35 + measuredVx * 0.65;
-    current.vy = current.vy * 0.35 + measuredVy * 0.65;
-    const speed = Math.hypot(current.vx, current.vy);
-    if (speed > 1200) {
-      const scale = 1200 / speed;
-      current.vx *= scale;
-      current.vy *= scale;
-    }
-  }
-
-  current.tx = x;
-  current.ty = y;
-  current.tmass = mass;
-  current.serverNow = serverNow;
+  const dt = clamp((arrival - current.toAt) / 1000, 1 / 120, 0.25);
+  current.fromX = current.toX;
+  current.fromY = current.toY;
+  current.fromMass = current.toMass;
+  current.fromAt = current.toAt;
+  current.toX = x;
+  current.toY = y;
+  current.toMass = mass;
+  current.toAt = arrival;
+  current.vx = clamp((current.toX - current.fromX) / dt, -1400, 1400);
+  current.vy = clamp((current.toY - current.fromY) / dt, -1400, 1400);
   Object.assign(current, extra);
 }
 
-function reconcileVisuals(s) {
+function updateOwn(cell, player, arrival) {
+  const current = visualCells.get(cell.id);
+  if (!current) {
+    visualCells.set(cell.id, {
+      id: cell.id,
+      ownerId: player.id,
+      name: player.name,
+      color: player.color,
+      bot: player.bot,
+      x: cell.x,
+      y: cell.y,
+      mass: cell.mass,
+      serverX: cell.x,
+      serverY: cell.y,
+      serverMass: cell.mass,
+      lastServerX: cell.x,
+      lastServerY: cell.y,
+      serverAt: arrival,
+      serverVx: 0,
+      serverVy: 0,
+      boostUntilLocal: 0,
+    });
+    return;
+  }
+
+  const dt = clamp((arrival - current.serverAt) / 1000, 1 / 120, 0.25);
+  const vx = (cell.x - current.serverX) / dt;
+  const vy = (cell.y - current.serverY) / dt;
+  const measuredSpeed = Math.hypot(vx, vy);
+  const normalSpeed = speedFromMass(cell.mass);
+
+  current.lastServerX = current.serverX;
+  current.lastServerY = current.serverY;
+  current.serverX = cell.x;
+  current.serverY = cell.y;
+  current.serverMass = cell.mass;
+  current.serverAt = arrival;
+  current.serverVx = current.serverVx * 0.3 + vx * 0.7;
+  current.serverVy = current.serverVy * 0.3 + vy * 0.7;
+  if (measuredSpeed > normalSpeed * 1.35) current.boostUntilLocal = arrival + 180;
+  current.name = player.name;
+  current.color = player.color;
+  current.bot = player.bot;
+}
+
+function reconcileVisuals(s, arrival) {
   const seenCells = new Set();
   for (const player of s.players) {
     for (const cell of player.cells) {
       seenCells.add(cell.id);
-      updateVisual(visualCells, cell.id, cell.x, cell.y, cell.mass, s.now, {
+      if (player.id === selfId) updateOwn(cell, player, arrival);
+      else updateRemote(visualCells, cell.id, cell.x, cell.y, cell.mass, arrival, {
         ownerId: player.id,
         name: player.name,
         color: player.color,
@@ -133,37 +207,35 @@ function reconcileVisuals(s) {
   const seenEjected = new Set();
   for (const blob of s.ejected) {
     seenEjected.add(blob.id);
-    updateVisual(visualEjected, blob.id, blob.x, blob.y, blob.mass, s.now, { color: blob.color });
+    updateRemote(visualEjected, blob.id, blob.x, blob.y, blob.mass, arrival, { color: blob.color });
   }
   for (const id of visualEjected.keys()) if (!seenEjected.has(id)) visualEjected.delete(id);
 
   const seenViruses = new Set();
   for (const virus of s.viruses) {
     seenViruses.add(virus.id);
-    updateVisual(visualViruses, virus.id, virus.x, virus.y, virus.mass, s.now, { fed: virus.fed });
+    updateRemote(visualViruses, virus.id, virus.x, virus.y, virus.mass, arrival, { fed: virus.fed });
   }
   for (const id of visualViruses.keys()) if (!seenViruses.has(id)) visualViruses.delete(id);
 }
 
 function onSnapshot(s) {
+  const arrival = performance.now();
+  updateNetworkTiming(arrival);
+  if (!Array.isArray(s.pellets) && Array.isArray(snapshot?.pellets)) s.pellets = snapshot.pellets;
   snapshot = s;
-  lastSnapshotArrival = performance.now();
-  reconcileVisuals(s);
+  reconcileVisuals(s, arrival);
 
   const me = s.players.find(player => player.id === selfId);
   const alive = !!me && me.cells.length > 0;
   if (me) {
-    const total = me.cells.reduce((sum, cell) => sum + cell.mass, 0);
-    stats.textContent = `Mass ${Math.round(total)} · Cells ${me.cells.length} · ${Math.round(fps)} FPS`;
-    deathScore.textContent = `Final mass: ${Math.round(total)}`;
+    latestMass = me.cells.reduce((sum, cell) => sum + cell.mass, 0);
+    latestCellCount = me.cells.length;
+    deathScore.textContent = `Final mass: ${Math.round(latestMass)}`;
   }
   if (lastAlive && !alive) dead.classList.remove('hidden');
   if (!lastAlive && alive) dead.classList.add('hidden');
   lastAlive = alive;
-
-  leaderboard.innerHTML = s.leaderboard.map(entry =>
-    `<li${entry.id === selfId ? ' class="self"' : ''}>${escapeHtml(entry.name)} <span>${entry.mass}</span></li>`
-  ).join('');
 }
 
 function worldFromScreen(px, py) {
@@ -178,7 +250,7 @@ function sendInput() {
   const point = worldFromScreen(mouse.x, mouse.y);
   ws.send(JSON.stringify({ type: 'input', x: point.x, y: point.y }));
 }
-setInterval(sendInput, 1000 / 30);
+setInterval(sendInput, 1000 / INPUT_HZ);
 
 canvas.addEventListener('pointermove', event => { mouse = { x: event.clientX, y: event.clientY }; }, { passive: true });
 canvas.addEventListener('pointerdown', event => { mouse = { x: event.clientX, y: event.clientY }; }, { passive: true });
@@ -195,41 +267,93 @@ document.getElementById('splitBtn').addEventListener('click', () => action('spli
 document.getElementById('ejectBtn').addEventListener('click', () => action('eject'));
 respawnBtn.addEventListener('click', () => action('respawn'));
 
-function advanceVisuals(dt, now) {
-  const snapshotAge = clamp((now - lastSnapshotArrival) / 1000, 0, 0.11);
-  for (const cell of visualCells.values()) {
-    const self = cell.ownerId === selfId;
-    const desiredX = cell.tx + cell.vx * snapshotAge;
-    const desiredY = cell.ty + cell.vy * snapshotAge;
-    const positionRate = self ? 22 : 15;
-    const positionBlend = 1 - Math.exp(-positionRate * dt);
-    const massBlend = 1 - Math.exp(-12 * dt);
-    cell.x += (desiredX - cell.x) * positionBlend;
-    cell.y += (desiredY - cell.y) * positionBlend;
-    cell.mass += (cell.tmass - cell.mass) * massBlend;
+function interpolationDelay() {
+  return clamp(snapshotInterval + snapshotJitter * 2.25, 42, 115);
+}
+
+function interpolateRemote(entity, now) {
+  const span = Math.max(1, entity.toAt - entity.fromAt);
+  const renderAt = now - interpolationDelay();
+  const alpha = (renderAt - entity.fromAt) / span;
+  if (alpha <= 1) {
+    const t = clamp(alpha, 0, 1);
+    entity.x = entity.fromX + (entity.toX - entity.fromX) * t;
+    entity.y = entity.fromY + (entity.toY - entity.fromY) * t;
+    entity.mass = entity.fromMass + (entity.toMass - entity.fromMass) * t;
+    return;
   }
 
-  for (const map of [visualEjected, visualViruses]) {
-    for (const entity of map.values()) {
-      const desiredX = entity.tx + entity.vx * snapshotAge;
-      const desiredY = entity.ty + entity.vy * snapshotAge;
-      const blend = 1 - Math.exp(-18 * dt);
-      entity.x += (desiredX - entity.x) * blend;
-      entity.y += (desiredY - entity.y) * blend;
-      entity.mass += (entity.tmass - entity.mass) * (1 - Math.exp(-10 * dt));
+  const extra = Math.min((renderAt - entity.toAt) / 1000, 0.025);
+  entity.x = entity.toX + entity.vx * extra;
+  entity.y = entity.toY + entity.vy * extra;
+  entity.mass = entity.toMass;
+}
+
+function predictOwn(cell, dt, now) {
+  const target = worldFromScreen(mouse.x, mouse.y);
+  const massBlend = 1 - Math.exp(-14 * dt);
+  cell.mass += (cell.serverMass - cell.mass) * massBlend;
+
+  if (now < cell.boostUntilLocal) {
+    cell.x += cell.serverVx * dt;
+    cell.y += cell.serverVy * dt;
+  } else {
+    const dx = target.x - cell.x;
+    const dy = target.y - cell.y;
+    const distance = Math.hypot(dx, dy);
+    if (distance > 0.001) {
+      const r = radius(cell.mass);
+      const throttle = clamp(distance / Math.max(r, 60), 0, 1);
+      const speed = speedFromMass(cell.mass) * throttle;
+      cell.x += dx / distance * speed * dt;
+      cell.y += dy / distance * speed * dt;
     }
+  }
+
+  const oneWaySeconds = clamp(rtt / 2000 + snapshotInterval / 2000, 0.012, 0.11);
+  const projectedX = cell.serverX + cell.serverVx * oneWaySeconds;
+  const projectedY = cell.serverY + cell.serverVy * oneWaySeconds;
+  const errorX = projectedX - cell.x;
+  const errorY = projectedY - cell.y;
+  const error = Math.hypot(errorX, errorY);
+  const reconcileRate = error > 140 ? 16 : error > 70 ? 7 : 2.4;
+  const correction = 1 - Math.exp(-reconcileRate * dt);
+  cell.x += errorX * correction;
+  cell.y += errorY * correction;
+
+  if (snapshot) {
+    const r = radius(cell.mass);
+    cell.x = clamp(cell.x, r + WORLD_MARGIN, snapshot.world.width - r - WORLD_MARGIN);
+    cell.y = clamp(cell.y, r + WORLD_MARGIN, snapshot.world.height - r - WORLD_MARGIN);
   }
 }
 
-function updateCamera(dt) {
-  const ownCells = [...visualCells.values()].filter(cell => cell.ownerId === selfId);
-  if (!ownCells.length) return;
-  const total = ownCells.reduce((sum, cell) => sum + cell.mass, 0);
-  if (total <= 0) return;
-  const centerX = ownCells.reduce((sum, cell) => sum + cell.x * cell.mass, 0) / total;
-  const centerY = ownCells.reduce((sum, cell) => sum + cell.y * cell.mass, 0) / total;
-  const targetZoom = clamp(1.12 / Math.pow(total / 40, 0.09), 0.28, 1.05);
+function advanceVisuals(dt, now) {
+  for (const cell of visualCells.values()) {
+    if (cell.ownerId === selfId) predictOwn(cell, dt, now);
+    else interpolateRemote(cell, now);
+  }
+  for (const entity of visualEjected.values()) interpolateRemote(entity, now);
+  for (const entity of visualViruses.values()) interpolateRemote(entity, now);
+}
 
+function updateCamera(dt) {
+  let total = 0;
+  let weightedX = 0;
+  let weightedY = 0;
+  let ownCount = 0;
+  for (const cell of visualCells.values()) {
+    if (cell.ownerId !== selfId) continue;
+    total += cell.mass;
+    weightedX += cell.x * cell.mass;
+    weightedY += cell.y * cell.mass;
+    ownCount++;
+  }
+  if (!ownCount || total <= 0) return;
+
+  const centerX = weightedX / total;
+  const centerY = weightedY / total;
+  const targetZoom = clamp(1.12 / Math.pow(total / 40, 0.09), 0.28, 1.05);
   if (!cameraInitialized) {
     camera.x = centerX;
     camera.y = centerY;
@@ -238,11 +362,20 @@ function updateCamera(dt) {
     return;
   }
 
-  const moveBlend = 1 - Math.exp(-9 * dt);
-  const zoomBlend = 1 - Math.exp(-6 * dt);
+  const moveBlend = ownCount === 1 ? 1 : 1 - Math.exp(-18 * dt);
+  const zoomBlend = 1 - Math.exp(-7 * dt);
   camera.x += (centerX - camera.x) * moveBlend;
   camera.y += (centerY - camera.y) * moveBlend;
   camera.zoom += (targetZoom - camera.zoom) * zoomBlend;
+}
+
+function updateUi(now, fps) {
+  if (now - lastUiUpdate < UI_INTERVAL_MS || !snapshot) return;
+  lastUiUpdate = now;
+  stats.textContent = `Mass ${Math.round(latestMass)} · Cells ${latestCellCount} · ${Math.round(fps)} FPS · ${Math.round(rtt)} ms`;
+  leaderboard.innerHTML = snapshot.leaderboard.map(entry =>
+    `<li${entry.id === selfId ? ' class="self"' : ''}>${escapeHtml(entry.name)} <span>${entry.mass}</span></li>`
+  ).join('');
 }
 
 function drawGrid(world) {
@@ -275,16 +408,14 @@ function toScreen(x, y) {
   };
 }
 
-function drawCircle(x, y, r, fill, stroke = 'rgba(255,255,255,.34)', lineWidth = 2, glow = false) {
+function drawCircle(x, y, r, fill, stroke = 'rgba(255,255,255,.34)', lineWidth = 2) {
   const point = toScreen(x, y);
   const rr = r * camera.zoom;
   if (point.x + rr < 0 || point.x - rr > innerWidth || point.y + rr < 0 || point.y - rr > innerHeight) return;
-  ctx.shadowBlur = 0;
   ctx.beginPath();
   ctx.arc(point.x, point.y, rr, 0, Math.PI * 2);
   ctx.fillStyle = fill;
   ctx.fill();
-  ctx.shadowBlur = 0;
   if (stroke) {
     ctx.strokeStyle = stroke;
     ctx.lineWidth = lineWidth;
@@ -296,7 +427,6 @@ function drawVirus(virus) {
   const point = toScreen(virus.x, virus.y);
   const r = radius(virus.mass) * camera.zoom;
   const spikes = 24;
-  ctx.save();
   ctx.beginPath();
   for (let i = 0; i < spikes * 2; i++) {
     const angle = i * Math.PI / spikes;
@@ -308,22 +438,22 @@ function drawVirus(virus) {
   ctx.closePath();
   ctx.fillStyle = '#20e978';
   ctx.fill();
-  ctx.shadowBlur = 0;
   ctx.strokeStyle = '#b7ffd1';
   ctx.lineWidth = 2;
   ctx.stroke();
-  ctx.restore();
 }
 
 function draw() {
   const now = performance.now();
   const frameMs = clamp(now - lastFrame, 1, 50);
   const dt = frameMs / 1000;
-  fps = fps * 0.92 + (1000 / frameMs) * 0.08;
+  const instantaneousFps = 1000 / frameMs;
+  draw.fps = (draw.fps || 60) * 0.92 + instantaneousFps * 0.08;
   lastFrame = now;
 
   advanceVisuals(dt, now);
   updateCamera(dt);
+  updateUi(now, draw.fps);
 
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
   ctx.fillStyle = backgroundGradient || '#040a18';
@@ -331,24 +461,22 @@ function draw() {
 
   if (snapshot) {
     drawGrid(snapshot.world);
-
-    for (const pellet of snapshot.pellets) drawCircle(pellet.x, pellet.y, 5.3, pellet.color, null, 0, true);
-    for (const blob of visualEjected.values()) drawCircle(blob.x, blob.y, radius(blob.mass), blob.color, 'rgba(255,255,255,.55)', 1.25, true);
+    for (const pellet of snapshot.pellets) drawCircle(pellet.x, pellet.y, 5.3, pellet.color, null, 0);
+    for (const blob of visualEjected.values()) drawCircle(blob.x, blob.y, radius(blob.mass), blob.color, 'rgba(255,255,255,.55)', 1.25);
     for (const virus of visualViruses.values()) drawVirus(virus);
 
-    const ordered = [...visualCells.values()].sort((a, b) => b.mass - a.mass);
+    const ordered = Array.from(visualCells.values());
+    ordered.sort((a, b) => b.mass - a.mass);
     for (const cell of ordered) {
       const r = radius(cell.mass);
       const isSelf = cell.ownerId === selfId;
-      drawCircle(cell.x, cell.y, r, cell.color, isSelf ? '#ffffff' : 'rgba(255,255,255,.38)', isSelf ? 3 : 2, true);
+      drawCircle(cell.x, cell.y, r, cell.color, isSelf ? '#ffffff' : 'rgba(255,255,255,.38)', isSelf ? 3 : 2);
       const point = toScreen(cell.x, cell.y);
       const rr = r * camera.zoom;
       if (rr > 18) {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillStyle = '#ffffff';
-        ctx.shadowColor = 'rgba(0,0,0,.65)';
-        ctx.shadowBlur = 5;
         ctx.font = `800 ${Math.max(10, Math.min(24, rr * 0.32))}px system-ui`;
         ctx.fillText(cell.name, point.x, point.y - (rr > 34 ? 6 : 0));
         if (rr > 34) {
@@ -357,7 +485,6 @@ function draw() {
           ctx.fillText(Math.round(cell.mass), point.x, point.y + 14);
           ctx.globalAlpha = 1;
         }
-        ctx.shadowBlur = 0;
       }
     }
   }
