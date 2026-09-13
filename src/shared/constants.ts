@@ -26,6 +26,7 @@ export const GAME = {
 } as const;
 
 export const COLORS = [
-  '#4cc9f0', '#4895ef', '#4361ee', '#7209b7', '#b5179e', '#f72585',
-  '#ff595e', '#ff924c', '#ffca3a', '#8ac926', '#52b788', '#00b4d8',
+  '#00e5ff', '#2979ff', '#651fff', '#d500f9', '#ff2d95', '#ff1744',
+  '#ff6d00', '#ffd600', '#aeea00', '#00e676', '#00e5a8', '#00b0ff',
+  '#ff4081', '#ff9100', '#76ff03', '#1de9b6',
 ];
