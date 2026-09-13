@@ -119,9 +119,9 @@ export class Game {
       cell.mass = half;
       cell.canMergeAt = now + GAME.mergeBaseMs + half * GAME.mergeMassFactorMs;
       const r = radiusFromMass(half);
-      // Start the launched half clearly in front of the parent. The rigid collision
-      // pass below guarantees sibling cells remain tangent rather than overlapping.
-      const child = this.createCell(player.id, cell.x + dir.x * r * 1.15, cell.y + dir.y * r * 1.15, half);
+      // Equal split circles need 2r center distance just to be tangent. Spawn the
+      // launched half slightly beyond tangent so there is never a visible overlap.
+      const child = this.createCell(player.id, cell.x + dir.x * r * 2.05, cell.y + dir.y * r * 2.05, half);
       child.vx = dir.x * GAME.splitBoostSpeed;
       child.vy = dir.y * GAME.splitBoostSpeed;
       child.boostUntil = now + GAME.splitBoostMs;
@@ -131,7 +131,7 @@ export class Game {
     }
     player.cells.push(...additions);
     player.lastSplitAt = now;
-    this.resolveOwnCellCollisions(1 / Math.max(1, this.config.tickRate), now);
+    this.resolveOwnCellCollisions(now);
   }
 
   eject(player: Player, now = Date.now()) {
@@ -155,15 +155,15 @@ export class Game {
   tick(dt: number, now = Date.now()) {
     this.updateBots(now);
     this.moveDynamic(dt, now);
-    this.resolveOwnCellCollisions(dt, now);
+    this.resolveOwnCellCollisions(now);
     this.consumePellets();
     this.consumeEjected();
     this.feedViruses();
     this.consumeViruses(now);
     this.consumePlayers();
-    // Growth, virus pops and eating can change radii inside this tick, so resolve
-    // sibling rigid collisions again before allowing merge-ready cells to combine.
-    this.resolveOwnCellCollisions(dt, now);
+    // Growth, virus pops and eating can change radii inside this tick, so enforce
+    // the non-overlap constraint again before merge-ready cells are combined.
+    this.resolveOwnCellCollisions(now);
     this.mergeOwnCells(now);
     this.decayMass(dt);
     this.clampCellsToWorld();
@@ -209,59 +209,70 @@ export class Game {
   }
 
   /**
-   * Resolve rigid collisions between cells owned by the same player while they
-   * are still on merge cooldown. For two circles, penetration is
-   *   overlap = r1 + r2 - distance.
-   * We separate along the center normal and distribute displacement by the
-   * opposite radius, which makes the smaller cell move more than the larger.
+   * Enforce a hard non-overlap constraint between a player's own cells while
+   * either cell is still on merge cooldown. This is a positional circle solver:
+   * penetration = rA + rB + padding - centerDistance.
+   *
+   * Multiple Gauss-Seidel passes are intentional. A single pair pass is not
+   * sufficient for virus pops (many circles born close together), and clamping a
+   * cell against a world wall can leave residual penetration that a later pass
+   * must transfer into the unconstrained sibling.
    */
-  private resolveOwnCellCollisions(dt: number, now: number) {
-    const response = clamp(dt * 48, 0, 1);
-    if (response <= 0) return;
+  private resolveOwnCellCollisions(now: number) {
+    const padding = 0.75;
+    const iterations = 10;
 
     for (const player of this.players.values()) {
       const cells = player.cells;
-      for (let i = 0; i < cells.length; i++) {
-        const a = cells[i]; if (!a) continue;
-        for (let j = i + 1; j < cells.length; j++) {
-          const b = cells[j]; if (!b) continue;
-          // Once both timers have elapsed they must be allowed to overlap so the
-          // merge rule can bring them back into one cell.
-          if (now >= a.canMergeAt && now >= b.canMergeAt) continue;
+      if (cells.length < 2) continue;
 
-          const ar = radiusFromMass(a.mass);
-          const br = radiusFromMass(b.mass);
-          const minDistance = ar + br;
-          let dx = b.x - a.x;
-          let dy = b.y - a.y;
-          let distance = Math.hypot(dx, dy);
-          if (distance >= minDistance) continue;
+      for (let pass = 0; pass < iterations; pass++) {
+        let corrected = false;
+        for (let i = 0; i < cells.length; i++) {
+          const a = cells[i]; if (!a) continue;
+          for (let j = i + 1; j < cells.length; j++) {
+            const b = cells[j]; if (!b) continue;
+            // Once both timers have elapsed, overlap is allowed so the merge rule
+            // can draw the pieces into one another and recombine them.
+            if (now >= a.canMergeAt && now >= b.canMergeAt) continue;
 
-          if (distance < 0.0001) {
-            // Deterministic fallback direction prevents NaNs for virus-pop cells
-            // that can be created on almost identical coordinates.
-            const angle = ((a.id * 0.754877666 + b.id * 0.569840296) % 1) * Math.PI * 2;
-            dx = Math.cos(angle);
-            dy = Math.sin(angle);
-            distance = 1;
+            const ar = radiusFromMass(a.mass);
+            const br = radiusFromMass(b.mass);
+            const minDistance = ar + br + padding;
+            let dx = b.x - a.x;
+            let dy = b.y - a.y;
+            let distance = Math.hypot(dx, dy);
+            if (distance >= minDistance) continue;
+
+            let nx: number;
+            let ny: number;
+            if (distance < 0.0001) {
+              const angle = (((a.id * 0.754877666 + b.id * 0.569840296 + pass * 0.17320508) % 1) + 1) % 1 * Math.PI * 2;
+              nx = Math.cos(angle);
+              ny = Math.sin(angle);
+              distance = 0;
+            } else {
+              nx = dx / distance;
+              ny = dy / distance;
+            }
+
+            const overlap = minDistance - distance;
+            const totalRadius = Math.max(0.0001, ar + br);
+            const moveA = overlap * (br / totalRadius);
+            const moveB = overlap * (ar / totalRadius);
+            a.x -= nx * moveA;
+            a.y -= ny * moveA;
+            b.x += nx * moveB;
+            b.y += ny * moveB;
+
+            a.x = clamp(a.x, ar + GAME.worldMargin, this.config.worldWidth - ar - GAME.worldMargin);
+            a.y = clamp(a.y, ar + GAME.worldMargin, this.config.worldHeight - ar - GAME.worldMargin);
+            b.x = clamp(b.x, br + GAME.worldMargin, this.config.worldWidth - br - GAME.worldMargin);
+            b.y = clamp(b.y, br + GAME.worldMargin, this.config.worldHeight - br - GAME.worldMargin);
+            corrected = true;
           }
-
-          const overlap = minDistance - distance;
-          const nx = dx / distance;
-          const ny = dy / distance;
-          const totalRadius = Math.max(0.0001, ar + br);
-          const moveA = overlap * (br / totalRadius) * response;
-          const moveB = overlap * (ar / totalRadius) * response;
-          a.x -= nx * moveA;
-          a.y -= ny * moveA;
-          b.x += nx * moveB;
-          b.y += ny * moveB;
-
-          a.x = clamp(a.x, ar + GAME.worldMargin, this.config.worldWidth - ar - GAME.worldMargin);
-          a.y = clamp(a.y, ar + GAME.worldMargin, this.config.worldHeight - ar - GAME.worldMargin);
-          b.x = clamp(b.x, br + GAME.worldMargin, this.config.worldWidth - br - GAME.worldMargin);
-          b.y = clamp(b.y, br + GAME.worldMargin, this.config.worldHeight - br - GAME.worldMargin);
         }
+        if (!corrected) break;
       }
     }
   }
@@ -336,15 +347,22 @@ export class Game {
     cell.mass = each;
     cell.canMergeAt = now + GAME.mergeBaseMs + each * GAME.mergeMassFactorMs;
     const r = radiusFromMass(each);
-    for (let i = 1; i < count; i++) {
-      const angle = (Math.PI * 2 * i) / count + Math.random() * 0.2;
-      const child = this.createCell(player.id, cell.x + Math.cos(angle) * r * 0.45, cell.y + Math.sin(angle) * r * 0.45, each);
+    const children = count - 1;
+    // Pack virus-pop children on a ring that is large enough for neighboring
+    // equal-radius circles to start non-overlapping, while also clearing the
+    // original center cell. The rigid solver handles walls and any residuals.
+    const ringRadius = Math.max(r * 2.1, (r + 0.5) / Math.max(0.08, Math.sin(Math.PI / Math.max(2, children))));
+    const phase = Math.random() * Math.PI * 2;
+    for (let i = 0; i < children; i++) {
+      const angle = phase + (Math.PI * 2 * i) / children;
+      const child = this.createCell(player.id, cell.x + Math.cos(angle) * ringRadius, cell.y + Math.sin(angle) * ringRadius, each);
       child.vx = Math.cos(angle) * GAME.splitBoostSpeed * 0.75;
       child.vy = Math.sin(angle) * GAME.splitBoostSpeed * 0.75;
       child.boostUntil = now + GAME.splitBoostMs * 0.8;
       child.canMergeAt = cell.canMergeAt;
       player.cells.push(child);
     }
+    this.resolveOwnCellCollisions(now);
   }
 
   private consumePlayers() {
@@ -511,6 +529,7 @@ export class Game {
             vx: Math.round(c.vx * 10) / 10,
             vy: Math.round(c.vy * 10) / 10,
             boostMs: Math.max(0, c.boostUntil - now),
+            mergeMs: Math.max(0, c.canMergeAt - now),
           })),
         })),
       pellets: [...this.pellets.values()].filter(inRange),
