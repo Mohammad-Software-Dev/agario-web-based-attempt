@@ -5,18 +5,23 @@ const hud = document.getElementById('hud');
 const dead = document.getElementById('dead');
 const form = document.getElementById('joinForm');
 const nameInput = document.getElementById('name');
+const scoreValue = document.getElementById('scoreValue');
 const stats = document.getElementById('stats');
 const leaderboard = document.getElementById('leaderboard');
 const deathScore = document.getElementById('deathScore');
 const respawnBtn = document.getElementById('respawn');
 const mobileControls = document.getElementById('mobileControls');
+const minimap = document.getElementById('minimap');
+const minimapCtx = minimap.getContext('2d', { alpha: true });
+const themeToggle = document.getElementById('themeToggle');
 
 const BASE_SPEED = 420;
 const WORLD_MARGIN = 8;
 const INPUT_HZ = 45;
 const PING_INTERVAL_MS = 1500;
-const UI_INTERVAL_MS = 250;
-const REMOTE_HISTORY_LIMIT = 12;
+const UI_INTERVAL_MS = 200;
+const MINIMAP_INTERVAL_MS = 100;
+const REMOTE_HISTORY_LIMIT = 10;
 
 let ws = null;
 let snapshot = null;
@@ -30,14 +35,16 @@ let pixelRatio = 1;
 let cameraInitialized = false;
 let backgroundGradient = null;
 let lastUiUpdate = 0;
+let lastMinimapUpdate = 0;
 let lastSnapshotArrival = 0;
 let snapshotInterval = 33.3;
 let snapshotJitter = 0;
 let rtt = 60;
 let latestMass = 0;
 let latestCellCount = 0;
-let serverTimelineServer = null;
-let serverTimelineLocal = null;
+let fps = 60;
+let theme = localStorage.getItem('cell-arena-theme');
+if (theme !== 'light' && theme !== 'dark') theme = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
 
 const visualCells = new Map();
 const visualEjected = new Map();
@@ -50,6 +57,34 @@ const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 }[char]));
 
+function rebuildBackground() {
+  backgroundGradient = ctx.createRadialGradient(
+    innerWidth * 0.5, innerHeight * 0.45, 0,
+    innerWidth * 0.5, innerHeight * 0.45, Math.max(innerWidth, innerHeight) * 0.8,
+  );
+  if (theme === 'light') {
+    backgroundGradient.addColorStop(0, '#f7fbff');
+    backgroundGradient.addColorStop(0.58, '#eaf3ff');
+    backgroundGradient.addColorStop(1, '#dce9f8');
+  } else {
+    backgroundGradient.addColorStop(0, '#101d45');
+    backgroundGradient.addColorStop(0.55, '#08152d');
+    backgroundGradient.addColorStop(1, '#040a18');
+  }
+}
+
+function applyTheme(nextTheme) {
+  theme = nextTheme === 'light' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = theme;
+  localStorage.setItem('cell-arena-theme', theme);
+  themeToggle.textContent = theme === 'dark' ? '☀ Light' : '☾ Dark';
+  themeToggle.setAttribute('aria-label', `Switch to ${theme === 'dark' ? 'light' : 'dark'} mode`);
+  rebuildBackground();
+}
+
+themeToggle.addEventListener('click', () => applyTheme(theme === 'dark' ? 'light' : 'dark'));
+applyTheme(theme);
+
 function resize() {
   const coarse = matchMedia('(pointer: coarse)').matches;
   const area = Math.max(1, innerWidth * innerHeight);
@@ -60,10 +95,16 @@ function resize() {
   canvas.style.width = `${innerWidth}px`;
   canvas.style.height = `${innerHeight}px`;
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-  backgroundGradient = ctx.createRadialGradient(innerWidth * 0.5, innerHeight * 0.45, 0, innerWidth * 0.5, innerHeight * 0.45, Math.max(innerWidth, innerHeight) * 0.8);
-  backgroundGradient.addColorStop(0, '#101d45');
-  backgroundGradient.addColorStop(0.55, '#08152d');
-  backgroundGradient.addColorStop(1, '#040a18');
+  rebuildBackground();
+
+  const miniCssSize = Math.min(180, Math.max(132, innerWidth * 0.15));
+  const miniRatio = Math.min(devicePixelRatio || 1, 2);
+  minimap.style.width = `${miniCssSize}px`;
+  minimap.style.height = `${miniCssSize}px`;
+  minimap.width = Math.round(miniCssSize * miniRatio);
+  minimap.height = Math.round(miniCssSize * miniRatio);
+  minimap.dataset.cssSize = String(miniCssSize);
+  minimap.dataset.ratio = String(miniRatio);
 }
 addEventListener('resize', resize, { passive: true });
 resize();
@@ -119,126 +160,91 @@ function updateNetworkTiming(arrival) {
   lastSnapshotArrival = arrival;
 }
 
-function mapServerTime(serverNow, arrival) {
-  const value = Number(serverNow);
-  if (!Number.isFinite(value)) return arrival;
-  if (serverTimelineServer === null || serverTimelineLocal === null) {
-    serverTimelineServer = value;
-    serverTimelineLocal = arrival;
-    return arrival;
-  }
-  const mapped = serverTimelineLocal + (value - serverTimelineServer);
-  if (Math.abs(mapped - arrival) > 3000) {
-    serverTimelineServer = value;
-    serverTimelineLocal = arrival;
-    return arrival;
-  }
-  return mapped;
-}
-
-function updateRemote(map, id, x, y, mass, sampleAt, extra = {}) {
-  const sample = { at: sampleAt, x, y, mass };
+function updatePassiveEntity(map, id, x, y, mass, arrival, extra = {}) {
+  const sample = { at: arrival, x, y, mass };
   const current = map.get(id);
   if (!current) {
-    map.set(id, {
-      id, x, y, mass,
-      history: [sample],
-      vx: 0,
-      vy: 0,
-      ...extra,
-    });
+    map.set(id, { id, x, y, mass, history: [sample], vx: 0, vy: 0, ...extra });
     return;
   }
-
   const history = current.history || (current.history = []);
   const previous = history[history.length - 1];
-  if (previous && sample.at <= previous.at) sample.at = previous.at + 0.01;
-
-  if (previous) {
-    const jump = Math.hypot(sample.x - previous.x, sample.y - previous.y);
-    if (jump > 900) {
-      history.length = 0;
-      current.x = sample.x;
-      current.y = sample.y;
-      current.mass = sample.mass;
-      current.vx = 0;
-      current.vy = 0;
-    }
-  }
-
   history.push(sample);
   while (history.length > REMOTE_HISTORY_LIMIT) history.shift();
-
-  if (history.length >= 2) {
-    const a = history[history.length - 2];
-    const b = history[history.length - 1];
-    const dt = clamp((b.at - a.at) / 1000, 1 / 120, 0.25);
-    const measuredVx = clamp((b.x - a.x) / dt, -1400, 1400);
-    const measuredVy = clamp((b.y - a.y) / dt, -1400, 1400);
-    current.vx = current.vx * 0.5 + measuredVx * 0.5;
-    current.vy = current.vy * 0.5 + measuredVy * 0.5;
+  if (previous) {
+    const dt = clamp((arrival - previous.at) / 1000, 1 / 120, 0.25);
+    current.vx = current.vx * 0.45 + clamp((x - previous.x) / dt, -1600, 1600) * 0.55;
+    current.vy = current.vy * 0.45 + clamp((y - previous.y) / dt, -1600, 1600) * 0.55;
   }
-
   Object.assign(current, extra);
 }
 
-function updateOwn(cell, player, arrival) {
-  const current = visualCells.get(cell.id);
-  if (!current) {
-    visualCells.set(cell.id, {
-      id: cell.id,
-      ownerId: player.id,
-      name: player.name,
-      color: player.color,
-      bot: player.bot,
-      x: cell.x,
-      y: cell.y,
-      mass: cell.mass,
-      serverX: cell.x,
-      serverY: cell.y,
-      serverMass: cell.mass,
-      lastServerX: cell.x,
-      lastServerY: cell.y,
-      serverAt: arrival,
-      serverVx: 0,
-      serverVy: 0,
-      boostUntilLocal: 0,
-    });
+function newPredictedCell(cell, player, arrival) {
+  return {
+    id: cell.id,
+    ownerId: player.id,
+    name: player.name,
+    color: player.color,
+    bot: player.bot,
+    x: cell.x,
+    y: cell.y,
+    mass: cell.mass,
+    serverX: cell.x,
+    serverY: cell.y,
+    serverMass: cell.mass,
+    serverAt: arrival,
+    serverVx: Number(cell.vx) || 0,
+    serverVy: Number(cell.vy) || 0,
+    predictedVx: Number(cell.vx) || 0,
+    predictedVy: Number(cell.vy) || 0,
+    boostUntilLocal: arrival + Math.max(0, Number(cell.boostMs) || 0),
+    targetX: Number(player.target?.x) || cell.x,
+    targetY: Number(player.target?.y) || cell.y,
+  };
+}
+
+function updatePredictedCell(cell, player, arrival) {
+  let current = visualCells.get(cell.id);
+  if (!current || current.ownerId !== player.id) {
+    current = newPredictedCell(cell, player, arrival);
+    visualCells.set(cell.id, current);
     return;
   }
 
   const dt = clamp((arrival - current.serverAt) / 1000, 1 / 120, 0.25);
-  const vx = (cell.x - current.serverX) / dt;
-  const vy = (cell.y - current.serverY) / dt;
-  const measuredSpeed = Math.hypot(vx, vy);
-  const normalSpeed = speedFromMass(cell.mass);
+  const measuredVx = (cell.x - current.serverX) / dt;
+  const measuredVy = (cell.y - current.serverY) / dt;
+  const reportedVx = Number(cell.vx);
+  const reportedVy = Number(cell.vy);
 
-  current.lastServerX = current.serverX;
-  current.lastServerY = current.serverY;
   current.serverX = cell.x;
   current.serverY = cell.y;
   current.serverMass = cell.mass;
   current.serverAt = arrival;
-  current.serverVx = current.serverVx * 0.3 + vx * 0.7;
-  current.serverVy = current.serverVy * 0.3 + vy * 0.7;
-  if (measuredSpeed > normalSpeed * 1.35) current.boostUntilLocal = arrival + 180;
+  current.serverVx = Number.isFinite(reportedVx) ? reportedVx : current.serverVx * 0.35 + measuredVx * 0.65;
+  current.serverVy = Number.isFinite(reportedVy) ? reportedVy : current.serverVy * 0.35 + measuredVy * 0.65;
+  current.targetX = Number.isFinite(Number(player.target?.x)) ? Number(player.target.x) : current.targetX;
+  current.targetY = Number.isFinite(Number(player.target?.y)) ? Number(player.target.y) : current.targetY;
   current.name = player.name;
   current.color = player.color;
   current.bot = player.bot;
+
+  const boostMs = Math.max(0, Number(cell.boostMs) || 0);
+  if (boostMs > 0) {
+    current.boostUntilLocal = arrival + boostMs;
+    current.predictedVx = current.serverVx;
+    current.predictedVy = current.serverVy;
+  } else if (current.boostUntilLocal <= arrival) {
+    current.boostUntilLocal = 0;
+  }
 }
 
-function reconcileVisuals(s, arrival, sampleAt) {
+function reconcileVisuals(s, arrival) {
   const seenCells = new Set();
   for (const player of s.players) {
     for (const cell of player.cells) {
       seenCells.add(cell.id);
-      if (player.id === selfId) updateOwn(cell, player, arrival);
-      else updateRemote(visualCells, cell.id, cell.x, cell.y, cell.mass, sampleAt, {
-        ownerId: player.id,
-        name: player.name,
-        color: player.color,
-        bot: player.bot,
-      });
+      updatePredictedCell(cell, player, arrival);
     }
   }
   for (const id of visualCells.keys()) if (!seenCells.has(id)) visualCells.delete(id);
@@ -246,14 +252,14 @@ function reconcileVisuals(s, arrival, sampleAt) {
   const seenEjected = new Set();
   for (const blob of s.ejected) {
     seenEjected.add(blob.id);
-    updateRemote(visualEjected, blob.id, blob.x, blob.y, blob.mass, sampleAt, { color: blob.color });
+    updatePassiveEntity(visualEjected, blob.id, blob.x, blob.y, blob.mass, arrival, { color: blob.color });
   }
   for (const id of visualEjected.keys()) if (!seenEjected.has(id)) visualEjected.delete(id);
 
   const seenViruses = new Set();
   for (const virus of s.viruses) {
     seenViruses.add(virus.id);
-    updateRemote(visualViruses, virus.id, virus.x, virus.y, virus.mass, sampleAt, { fed: virus.fed });
+    updatePassiveEntity(visualViruses, virus.id, virus.x, virus.y, virus.mass, arrival, { fed: virus.fed });
   }
   for (const id of visualViruses.keys()) if (!seenViruses.has(id)) visualViruses.delete(id);
 }
@@ -261,10 +267,10 @@ function reconcileVisuals(s, arrival, sampleAt) {
 function onSnapshot(s) {
   const arrival = performance.now();
   updateNetworkTiming(arrival);
-  const sampleAt = mapServerTime(s.now, arrival);
   if (!Array.isArray(s.pellets) && Array.isArray(snapshot?.pellets)) s.pellets = snapshot.pellets;
+  if (!Array.isArray(s.minimap) && Array.isArray(snapshot?.minimap)) s.minimap = snapshot.minimap;
   snapshot = s;
-  reconcileVisuals(s, arrival, sampleAt);
+  reconcileVisuals(s, arrival);
 
   const me = s.players.find(player => player.id === selfId);
   const alive = !!me && me.cells.length > 0;
@@ -307,121 +313,71 @@ document.getElementById('splitBtn').addEventListener('click', () => action('spli
 document.getElementById('ejectBtn').addEventListener('click', () => action('eject'));
 respawnBtn.addEventListener('click', () => action('respawn'));
 
-function interpolationDelay() {
-  return clamp(snapshotInterval * 2.8 + snapshotJitter * 3, 85, 160);
+function targetForCell(cell) {
+  if (cell.ownerId === selfId) return worldFromScreen(mouse.x, mouse.y);
+  return { x: cell.targetX, y: cell.targetY };
 }
 
-function velocityBetween(a, b) {
-  const dt = Math.max(0.001, (b.at - a.at) / 1000);
-  return {
-    x: clamp((b.x - a.x) / dt, -1400, 1400),
-    y: clamp((b.y - a.y) / dt, -1400, 1400),
-  };
-}
-
-function hermite(p1, p2, v1, v2, t, segmentSeconds) {
-  const t2 = t * t;
-  const t3 = t2 * t;
-  const h00 = 2 * t3 - 3 * t2 + 1;
-  const h10 = t3 - 2 * t2 + t;
-  const h01 = -2 * t3 + 3 * t2;
-  const h11 = t3 - t2;
-  return {
-    x: h00 * p1.x + h10 * v1.x * segmentSeconds + h01 * p2.x + h11 * v2.x * segmentSeconds,
-    y: h00 * p1.y + h10 * v1.y * segmentSeconds + h01 * p2.y + h11 * v2.y * segmentSeconds,
-  };
-}
-
-function interpolateRemote(entity, now) {
-  const history = entity.history;
-  if (!history?.length) return;
-
-  const renderAt = now - interpolationDelay();
-  const first = history[0];
-  const latest = history[history.length - 1];
-
-  if (history.length === 1 || renderAt <= first.at) {
-    entity.x = first.x;
-    entity.y = first.y;
-    entity.mass = first.mass;
-    return;
+function projectServerState(cell, seconds, now) {
+  let x = cell.serverX;
+  let y = cell.serverY;
+  let vx = cell.serverVx;
+  let vy = cell.serverVy;
+  const mass = Math.max(1, cell.serverMass);
+  const boostRemaining = Math.max(0, cell.boostUntilLocal - now) / 1000;
+  const boostStep = Math.min(seconds, boostRemaining);
+  if (boostStep > 0) {
+    x += vx * boostStep;
+    y += vy * boostStep;
+    vx *= Math.pow(0.02, boostStep);
+    vy *= Math.pow(0.02, boostStep);
   }
-
-  let upperIndex = -1;
-  for (let i = 1; i < history.length; i++) {
-    if (history[i].at >= renderAt) {
-      upperIndex = i;
-      break;
+  const normalStep = seconds - boostStep;
+  if (normalStep > 0) {
+    const dx = cell.targetX - x;
+    const dy = cell.targetY - y;
+    const distance = Math.hypot(dx, dy);
+    if (distance > 0.001) {
+      const throttle = clamp(distance / Math.max(radius(mass), 60), 0, 1);
+      const speed = speedFromMass(mass) * throttle;
+      x += dx / distance * speed * normalStep;
+      y += dy / distance * speed * normalStep;
     }
   }
-
-  if (upperIndex !== -1) {
-    const p1 = history[upperIndex - 1];
-    const p2 = history[upperIndex];
-    const p0 = history[Math.max(0, upperIndex - 2)];
-    const p3 = history[Math.min(history.length - 1, upperIndex + 1)];
-    const segmentMs = Math.max(1, p2.at - p1.at);
-    const segmentSeconds = segmentMs / 1000;
-    const t = clamp((renderAt - p1.at) / segmentMs, 0, 1);
-
-    const v1 = velocityBetween(p0, p2);
-    const v2 = velocityBetween(p1, p3);
-    const curved = hermite(p1, p2, v1, v2, t, segmentSeconds);
-    const linearX = p1.x + (p2.x - p1.x) * t;
-    const linearY = p1.y + (p2.y - p1.y) * t;
-    const curveDx = curved.x - linearX;
-    const curveDy = curved.y - linearY;
-    const curveDistance = Math.hypot(curveDx, curveDy);
-    const segmentDistance = Math.hypot(p2.x - p1.x, p2.y - p1.y);
-    const maxCurve = Math.max(2, segmentDistance * 0.22);
-    const curveScale = curveDistance > maxCurve ? maxCurve / curveDistance : 1;
-
-    entity.x = linearX + curveDx * curveScale;
-    entity.y = linearY + curveDy * curveScale;
-    entity.mass = p1.mass + (p2.mass - p1.mass) * t;
-    return;
-  }
-
-  const overrunMs = renderAt - latest.at;
-  if (overrunMs <= 35 && history.length >= 2) {
-    const extra = overrunMs / 1000;
-    entity.x = latest.x + entity.vx * extra;
-    entity.y = latest.y + entity.vy * extra;
-  } else {
-    entity.x = latest.x;
-    entity.y = latest.y;
-  }
-  entity.mass = latest.mass;
+  return { x, y };
 }
 
-function predictOwn(cell, dt, now) {
-  const target = worldFromScreen(mouse.x, mouse.y);
+function predictPlayerCell(cell, dt, now) {
   const massBlend = 1 - Math.exp(-14 * dt);
   cell.mass += (cell.serverMass - cell.mass) * massBlend;
 
   if (now < cell.boostUntilLocal) {
-    cell.x += cell.serverVx * dt;
-    cell.y += cell.serverVy * dt;
+    cell.x += cell.predictedVx * dt;
+    cell.y += cell.predictedVy * dt;
+    cell.predictedVx *= Math.pow(0.02, dt);
+    cell.predictedVy *= Math.pow(0.02, dt);
   } else {
+    const target = targetForCell(cell);
     const dx = target.x - cell.x;
     const dy = target.y - cell.y;
     const distance = Math.hypot(dx, dy);
     if (distance > 0.001) {
-      const r = radius(cell.mass);
-      const throttle = clamp(distance / Math.max(r, 60), 0, 1);
+      const throttle = clamp(distance / Math.max(radius(cell.mass), 60), 0, 1);
       const speed = speedFromMass(cell.mass) * throttle;
       cell.x += dx / distance * speed * dt;
       cell.y += dy / distance * speed * dt;
     }
   }
 
-  const oneWaySeconds = clamp(rtt / 2000 + snapshotInterval / 2000, 0.012, 0.11);
-  const projectedX = cell.serverX + cell.serverVx * oneWaySeconds;
-  const projectedY = cell.serverY + cell.serverVy * oneWaySeconds;
-  const errorX = projectedX - cell.x;
-  const errorY = projectedY - cell.y;
+  // All player/bot cells use the same prediction and reconciliation constants.
+  // The server snapshot is projected forward by estimated one-way latency before
+  // correcting, so remote cells do not get pulled backwards toward stale samples.
+  const horizon = clamp(rtt / 2000 + snapshotInterval / 2000, 0.012, 0.105);
+  const projected = projectServerState(cell, horizon, now);
+  const errorX = projected.x - cell.x;
+  const errorY = projected.y - cell.y;
   const error = Math.hypot(errorX, errorY);
-  const reconcileRate = error > 140 ? 16 : error > 70 ? 7 : 2.4;
+  const reconcileRate = error > 160 ? 15 : error > 80 ? 6.5 : 2.2;
   const correction = 1 - Math.exp(-reconcileRate * dt);
   cell.x += errorX * correction;
   cell.y += errorY * correction;
@@ -433,13 +389,42 @@ function predictOwn(cell, dt, now) {
   }
 }
 
-function advanceVisuals(dt, now) {
-  for (const cell of visualCells.values()) {
-    if (cell.ownerId === selfId) predictOwn(cell, dt, now);
-    else interpolateRemote(cell, now);
+function interpolationDelay() {
+  return clamp(snapshotInterval * 2.2 + snapshotJitter * 2.5, 58, 125);
+}
+
+function interpolatePassive(entity, now) {
+  const history = entity.history;
+  if (!history?.length) return;
+  const renderAt = now - interpolationDelay();
+  if (history.length === 1 || renderAt <= history[0].at) {
+    entity.x = history[0].x;
+    entity.y = history[0].y;
+    entity.mass = history[0].mass;
+    return;
   }
-  for (const entity of visualEjected.values()) interpolateRemote(entity, now);
-  for (const entity of visualViruses.values()) interpolateRemote(entity, now);
+  for (let i = 1; i < history.length; i++) {
+    const b = history[i];
+    if (b.at < renderAt) continue;
+    const a = history[i - 1];
+    const t = clamp((renderAt - a.at) / Math.max(1, b.at - a.at), 0, 1);
+    const smooth = t * t * (3 - 2 * t);
+    entity.x = a.x + (b.x - a.x) * smooth;
+    entity.y = a.y + (b.y - a.y) * smooth;
+    entity.mass = a.mass + (b.mass - a.mass) * smooth;
+    return;
+  }
+  const latest = history[history.length - 1];
+  const extra = Math.min(Math.max(0, renderAt - latest.at) / 1000, 0.025);
+  entity.x = latest.x + entity.vx * extra;
+  entity.y = latest.y + entity.vy * extra;
+  entity.mass = latest.mass;
+}
+
+function advanceVisuals(dt, now) {
+  for (const cell of visualCells.values()) predictPlayerCell(cell, dt, now);
+  for (const entity of visualEjected.values()) interpolatePassive(entity, now);
+  for (const entity of visualViruses.values()) interpolatePassive(entity, now);
 }
 
 function updateCamera(dt) {
@@ -474,13 +459,62 @@ function updateCamera(dt) {
   camera.zoom += (targetZoom - camera.zoom) * zoomBlend;
 }
 
-function updateUi(now, fps) {
+function updateUi(now) {
   if (now - lastUiUpdate < UI_INTERVAL_MS || !snapshot) return;
   lastUiUpdate = now;
-  stats.textContent = `Mass ${Math.round(latestMass)} · Cells ${latestCellCount} · ${Math.round(fps)} FPS · ${Math.round(rtt)} ms`;
+  scoreValue.textContent = Math.round(latestMass).toLocaleString();
+  stats.textContent = `${latestCellCount} cell${latestCellCount === 1 ? '' : 's'} · ${Math.round(fps)} FPS · ${Math.round(rtt)} ms`;
   leaderboard.innerHTML = snapshot.leaderboard.map(entry =>
     `<li${entry.id === selfId ? ' class="self"' : ''}>${escapeHtml(entry.name)} <span>${entry.mass}</span></li>`
   ).join('');
+}
+
+function drawMinimap(now) {
+  if (!snapshot || now - lastMinimapUpdate < MINIMAP_INTERVAL_MS) return;
+  lastMinimapUpdate = now;
+  const cssSize = Number(minimap.dataset.cssSize) || 160;
+  const ratio = Number(minimap.dataset.ratio) || 1;
+  minimapCtx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  minimapCtx.clearRect(0, 0, cssSize, cssSize);
+
+  minimapCtx.fillStyle = theme === 'light' ? 'rgba(255,255,255,.88)' : 'rgba(3,9,24,.78)';
+  minimapCtx.fillRect(0, 0, cssSize, cssSize);
+  minimapCtx.strokeStyle = theme === 'light' ? 'rgba(30,70,120,.18)' : 'rgba(102,247,255,.18)';
+  minimapCtx.lineWidth = 1;
+  for (let i = 1; i < 5; i++) {
+    const p = cssSize * i / 5;
+    minimapCtx.beginPath(); minimapCtx.moveTo(p, 0); minimapCtx.lineTo(p, cssSize); minimapCtx.stroke();
+    minimapCtx.beginPath(); minimapCtx.moveTo(0, p); minimapCtx.lineTo(cssSize, p); minimapCtx.stroke();
+  }
+
+  const sx = cssSize / snapshot.world.width;
+  const sy = cssSize / snapshot.world.height;
+  for (const entry of snapshot.minimap || []) {
+    const x = entry.x * sx;
+    const y = entry.y * sy;
+    const isSelf = entry.id === selfId;
+    const dot = isSelf ? 5 : clamp(2.2 + Math.log10(Math.max(10, entry.mass)) * 0.7, 2.5, 4.2);
+    minimapCtx.beginPath();
+    minimapCtx.arc(x, y, dot, 0, Math.PI * 2);
+    minimapCtx.fillStyle = entry.color || '#00e5ff';
+    minimapCtx.fill();
+    if (isSelf) {
+      minimapCtx.strokeStyle = theme === 'light' ? '#17243d' : '#ffffff';
+      minimapCtx.lineWidth = 2;
+      minimapCtx.stroke();
+    }
+  }
+
+  const viewportW = Math.min(snapshot.world.width, innerWidth / camera.zoom);
+  const viewportH = Math.min(snapshot.world.height, innerHeight / camera.zoom);
+  minimapCtx.strokeStyle = theme === 'light' ? 'rgba(20,50,90,.55)' : 'rgba(255,255,255,.55)';
+  minimapCtx.lineWidth = 1;
+  minimapCtx.strokeRect(
+    clamp((camera.x - viewportW / 2) * sx, 0, cssSize),
+    clamp((camera.y - viewportH / 2) * sy, 0, cssSize),
+    viewportW * sx,
+    viewportH * sy,
+  );
 }
 
 function drawGrid(world) {
@@ -489,7 +523,7 @@ function drawGrid(world) {
   const cx = innerWidth / 2 - camera.x * camera.zoom;
   const cy = innerHeight / 2 - camera.y * camera.zoom;
   ctx.save();
-  ctx.strokeStyle = 'rgba(46, 196, 255, .10)';
+  ctx.strokeStyle = theme === 'light' ? 'rgba(35,80,130,.10)' : 'rgba(46,196,255,.10)';
   ctx.lineWidth = 1;
   const startX = ((cx % scaledGap) + scaledGap) % scaledGap;
   const startY = ((cy % scaledGap) + scaledGap) % scaledGap;
@@ -499,7 +533,7 @@ function drawGrid(world) {
   for (let y = startY; y < innerHeight; y += scaledGap) {
     ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(innerWidth, y); ctx.stroke();
   }
-  ctx.strokeStyle = 'rgba(0, 229, 255, .42)';
+  ctx.strokeStyle = theme === 'light' ? 'rgba(23,100,180,.34)' : 'rgba(0,229,255,.42)';
   ctx.lineWidth = 3;
   const point = toScreen(0, 0);
   ctx.strokeRect(point.x, point.y, world.width * camera.zoom, world.height * camera.zoom);
@@ -543,7 +577,7 @@ function drawVirus(virus) {
   ctx.closePath();
   ctx.fillStyle = '#20e978';
   ctx.fill();
-  ctx.strokeStyle = '#b7ffd1';
+  ctx.strokeStyle = theme === 'light' ? '#08753a' : '#b7ffd1';
   ctx.lineWidth = 2;
   ctx.stroke();
 }
@@ -552,44 +586,46 @@ function draw() {
   const now = performance.now();
   const frameMs = clamp(now - lastFrame, 1, 50);
   const dt = frameMs / 1000;
-  const instantaneousFps = 1000 / frameMs;
-  draw.fps = (draw.fps || 60) * 0.92 + instantaneousFps * 0.08;
+  fps = fps * 0.92 + (1000 / frameMs) * 0.08;
   lastFrame = now;
 
   advanceVisuals(dt, now);
   updateCamera(dt);
-  updateUi(now, draw.fps);
+  updateUi(now);
+  drawMinimap(now);
 
   ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-  ctx.fillStyle = backgroundGradient || '#040a18';
+  ctx.fillStyle = backgroundGradient || (theme === 'light' ? '#eaf3ff' : '#040a18');
   ctx.fillRect(0, 0, innerWidth, innerHeight);
 
   if (snapshot) {
     drawGrid(snapshot.world);
-    for (const pellet of snapshot.pellets) drawCircle(pellet.x, pellet.y, 5.3, pellet.color, null, 0);
+    for (const pellet of snapshot.pellets || []) drawCircle(pellet.x, pellet.y, 5.3, pellet.color, null, 0);
     for (const blob of visualEjected.values()) drawCircle(blob.x, blob.y, radius(blob.mass), blob.color, 'rgba(255,255,255,.55)', 1.25);
     for (const virus of visualViruses.values()) drawVirus(virus);
 
-    const ordered = Array.from(visualCells.values());
-    ordered.sort((a, b) => b.mass - a.mass);
+    const ordered = Array.from(visualCells.values()).sort((a, b) => b.mass - a.mass);
     for (const cell of ordered) {
       const r = radius(cell.mass);
       const isSelf = cell.ownerId === selfId;
-      drawCircle(cell.x, cell.y, r, cell.color, isSelf ? '#ffffff' : 'rgba(255,255,255,.38)', isSelf ? 3 : 2);
+      drawCircle(cell.x, cell.y, r, cell.color, isSelf ? '#ffffff' : 'rgba(255,255,255,.42)', isSelf ? 3 : 2);
       const point = toScreen(cell.x, cell.y);
       const rr = r * camera.zoom;
       if (rr > 18) {
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
         ctx.fillStyle = '#ffffff';
+        ctx.shadowColor = 'rgba(0,0,0,.62)';
+        ctx.shadowBlur = 4;
         ctx.font = `800 ${Math.max(10, Math.min(24, rr * 0.32))}px system-ui`;
         ctx.fillText(cell.name, point.x, point.y - (rr > 34 ? 6 : 0));
         if (rr > 34) {
           ctx.font = `700 ${Math.max(9, Math.min(15, rr * 0.2))}px system-ui`;
-          ctx.globalAlpha = 0.82;
+          ctx.globalAlpha = 0.86;
           ctx.fillText(Math.round(cell.mass), point.x, point.y + 14);
           ctx.globalAlpha = 1;
         }
+        ctx.shadowBlur = 0;
       }
     }
   }
