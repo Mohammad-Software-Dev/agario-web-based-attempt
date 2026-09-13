@@ -1,0 +1,31 @@
+export const GAME = {
+  startMass: 38,
+  maxCellsPerPlayer: 16,
+  minSplitMass: 36,
+  minEjectMass: 35,
+  ejectCost: 18,
+  ejectMass: 13,
+  foodMass: 1,
+  virusMass: 100,
+  eatRatio: 1.25,
+  splitEatRatio: 1.33,
+  maxCellMass: 22500,
+  baseSpeed: 420,
+  splitBoostSpeed: 760,
+  splitBoostMs: 420,
+  ejectSpeed: 780,
+  ejectCooldownMs: 90,
+  splitCooldownMs: 220,
+  mergeBaseMs: 30000,
+  mergeMassFactorMs: 23.3,
+  massDecayPerSecond: 0.0015,
+  worldMargin: 8,
+  botThinkMs: 180,
+  virusFeedThreshold: 7,
+  snapshotRadiusBase: 1400,
+} as const;
+
+export const COLORS = [
+  '#4cc9f0', '#4895ef', '#4361ee', '#7209b7', '#b5179e', '#f72585',
+  '#ff595e', '#ff924c', '#ffca3a', '#8ac926', '#52b788', '#00b4d8',
+];

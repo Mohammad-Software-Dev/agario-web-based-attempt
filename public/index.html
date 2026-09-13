@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no" />
+  <meta name="theme-color" content="#07111f" />
+  <title>Cell Arena</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <canvas id="game" aria-label="Cell Arena game canvas"></canvas>
+  <div id="hud" class="hidden">
+    <div class="brand">CELL ARENA</div>
+    <div id="stats"></div>
+    <ol id="leaderboard"></ol>
+    <div class="controls">Move: mouse/touch · Split: <b>Space</b> · Eject: <b>W</b></div>
+  </div>
+  <div id="menu" class="panel-wrap">
+    <div class="panel">
+      <div class="eyebrow">REAL-TIME MULTIPLAYER</div>
+      <h1>Cell Arena</h1>
+      <p>Eat, grow, split, dodge viruses, and outsmart autonomous bots.</p>
+      <form id="joinForm">
+        <input id="name" maxlength="20" autocomplete="nickname" placeholder="Your name" aria-label="Your name" />
+        <button type="submit">Play</button>
+      </form>
+      <div class="tips"><span>Mouse / touch to steer</span><span>Space to split</span><span>W to eject mass</span></div>
+      <small>Original implementation inspired by the cell-eating arcade genre. Not affiliated with Agar.io or Miniclip.</small>
+    </div>
+  </div>
+  <div id="dead" class="panel-wrap hidden">
+    <div class="panel compact"><h2>You were eaten</h2><p id="deathScore"></p><button id="respawn">Respawn</button></div>
+  </div>
+  <div id="mobileControls" class="mobile-controls hidden"><button id="ejectBtn">Eject</button><button id="splitBtn">Split</button></div>
+  <script type="module" src="/client.js"></script>
+</body>
+</html>
